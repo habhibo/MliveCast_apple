@@ -288,12 +288,10 @@ async function startAppleSponsorship(uid, body) {
   for (const doc of pending.docs.filter((item) =>
     item.get("appleProductId") === productId &&
     item.get("status") === "PENDING_PAYMENT")) {
-    const createdAt = doc.get("createdAt");
-    if (createdAt && Date.now() - createdAt.toMillis() < 60 * 60 * 1000) {
-      throw new Error("Finish or cancel your pending App Store purchase first");
-    }
-    await releaseReservation(doc.id, "PAYMENT_EXPIRED");
+    await releaseReservation(doc.id, "PAYMENT_REPLACED").catch(() => null);
   }
+  await db.collection("apple_sponsorship_pending")
+      .doc(appleLockId(uid, productId)).delete().catch(() => null);
 
   const owner = await getOwner(tier.ownerType, tier.ownerId);
   const sponsorUser = await db.collection("users").doc(uid).get();
@@ -361,13 +359,18 @@ async function startAppleSponsorship(uid, body) {
 }
 
 async function cancelAppleSponsorship(uid, body) {
-  const productId = id(body.productId, "productId");
+  const productId = body.productId ? id(body.productId, "productId") : null;
   const pending = await db.collection(SPONSORSHIPS)
       .where("sponsorUserId", "==", uid).get();
   for (const doc of pending.docs.filter((item) =>
-    item.get("appleProductId") === productId &&
-    item.get("status") === "PENDING_PAYMENT")) {
+    item.get("status") === "PENDING_PAYMENT" &&
+    (!productId || item.get("appleProductId") === productId) &&
+    (!body.sponsorshipId || doc.id === body.sponsorshipId))) {
     await releaseReservation(doc.id, "PAYMENT_CANCELLED");
+  }
+  if (productId) {
+    await db.collection("apple_sponsorship_pending")
+        .doc(appleLockId(uid, productId)).delete().catch(() => null);
   }
   return {success: true};
 }
@@ -396,11 +399,19 @@ async function activateAppleSponsorship(uid, transactionInfo) {
   const matchingPending = pending.docs.filter((item) =>
     item.get("appleProductId") === productId &&
     item.get("status") === "PENDING_PAYMENT");
-  if (matchingPending.length !== 1) {
-    throw new Error("Could not match the App Store payment to one pending sponsorship");
+  if (matchingPending.length === 0) {
+    throw new Error("Could not match the App Store payment to a pending sponsorship");
   }
+  matchingPending.sort((a, b) => {
+    const tA = a.get("createdAt") ? a.get("createdAt").toMillis() : 0;
+    const tB = b.get("createdAt") ? b.get("createdAt").toMillis() : 0;
+    return tB - tA;
+  });
   const sponsorshipId = matchingPending[0].id;
   const sponsorshipRef = matchingPending[0].ref;
+  for (let i = 1; i < matchingPending.length; i++) {
+    await releaseReservation(matchingPending[i].id, "PAYMENT_SUPERSEDED").catch(() => null);
+  }
   await db.runTransaction(async (transaction) => {
     const payment = await transaction.get(paymentRef);
     const sponsorship = await transaction.get(sponsorshipRef);

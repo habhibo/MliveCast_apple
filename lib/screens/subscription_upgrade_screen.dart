@@ -9,7 +9,6 @@ import 'package:in_app_purchase/in_app_purchase.dart';
 import 'package:url_launcher/url_launcher.dart';
 import '../data/apple_subscription_service.dart';
 import '../data/subscription_service.dart';
-import '../data/payment_service.dart';
 import '../models/subscription.dart';
 import '../theme/app_theme.dart';
 import '../widgets/community_safety_dialog.dart';
@@ -26,7 +25,6 @@ class SubscriptionUpgradeScreen extends StatefulWidget {
 
 class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
   final SubscriptionService _subscriptionService = SubscriptionService();
-  final PaymentService _paymentService = PaymentService();
   final InAppPurchase _store = InAppPurchase.instance;
   final AppleSubscriptionService _appleSubscriptions = AppleSubscriptionService();
   StreamSubscription<List<PurchaseDetails>>? _purchaseUpdates;
@@ -35,6 +33,8 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
   final Set<String> _requestedProductIds = {};
   Timer? _restoreRequestWindow;
   Timer? _purchaseTimeout;
+  bool _isRestoringPurchases = false;
+  String? _processingPlanId;
 
   String _cleanPrice(String rawPrice) {
     return rawPrice.replaceAllMapped(
@@ -51,6 +51,7 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
       },
     );
   }
+
   List<SubscriptionPlan> _plans = [];
   UserSubscription? _currentSubscription;
   bool _isLoading = true;
@@ -66,12 +67,12 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
   void initState() {
     super.initState();
     if (_usesAppleIap) {
-      // Subscribe before querying products so unfinished/restored transactions
-      // are handled even when StoreKit emits them during screen initialization.
       _purchaseUpdates = _store.purchaseStream.listen(
         _onPurchaseUpdates,
         onError: (Object error) {
-          if (mounted) setState(() => _storeError = 'The App Store purchase service is unavailable.');
+          if (mounted) {
+            setState(() => _storeError = 'The App Store purchase service is unavailable.');
+          }
         },
       );
       _loadAppleProducts();
@@ -113,43 +114,65 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
   }
 
   Future<void> _onPurchaseUpdates(List<PurchaseDetails> purchases) async {
+    bool hasCompletedPurchases = false;
+
     for (final purchase in purchases) {
+      // 1. Only process subscriptions configured for this screen
+      if (!AppleSubscriptionService.productToPlan.containsKey(purchase.productID)) {
+        continue;
+      }
+
       final transactionKey = purchase.purchaseID ??
-          '${purchase.productID}:${purchase.transactionDate ?? ''}:'
-              '${purchase.status.name}';
+          '${purchase.productID}:${purchase.transactionDate ?? ''}:${purchase.status.name}';
+
       if (purchase.status == PurchaseStatus.pending) {
         if (mounted) setState(() => _isProcessing = true);
         continue;
       }
-      if (purchase.status == PurchaseStatus.error || purchase.status == PurchaseStatus.canceled) {
+
+      if (purchase.status == PurchaseStatus.canceled || purchase.status == PurchaseStatus.error) {
         final wasRequested = _requestedProductIds.remove(purchase.productID);
         if (purchase.pendingCompletePurchase) {
-          await _store.completePurchase(purchase);
+          try {
+            await _store.completePurchase(purchase);
+          } catch (e) {
+            debugPrint('Error completing canceled/failed purchase: $e');
+          }
         }
         if (mounted) {
-          setState(() => _isProcessing = false);
+          setState(() {
+            _processingPlanId = null;
+            _isProcessing = false;
+          });
           if (wasRequested && purchase.status == PurchaseStatus.error) {
             _showMessage(purchase.error?.message ?? 'The App Store purchase could not be completed.');
           }
         }
-      } else if (purchase.status == PurchaseStatus.purchased ||
+        continue;
+      }
+
+      if (purchase.status == PurchaseStatus.purchased ||
           purchase.status == PurchaseStatus.restored) {
         final wasRequested = _requestedProductIds.remove(purchase.productID);
+        final isRestore = purchase.status == PurchaseStatus.restored || _isRestoringPurchases;
+
         if (!_handledPurchaseUpdates.add(transactionKey)) {
           if (purchase.pendingCompletePurchase) {
-            await _store.completePurchase(purchase);
+            try {
+              await _store.completePurchase(purchase);
+            } catch (e) {
+              debugPrint('Error completing already-handled purchase: $e');
+            }
           }
           continue;
         }
 
         bool backendSuccess = false;
         try {
-          if (AppleSubscriptionService.productToPlan.containsKey(purchase.productID)) {
-            await _appleSubscriptions.verifyAndActivate(
-              purchase.verificationData.serverVerificationData,
-            );
-            backendSuccess = true;
-          }
+          await _appleSubscriptions.verifyAndActivate(
+            purchase.verificationData.serverVerificationData,
+          );
+          backendSuccess = true;
         } catch (error) {
           debugPrint('Backend Apple subscription verification failed: $error');
         }
@@ -185,20 +208,36 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
           if (purchase.pendingCompletePurchase) {
             await _store.completePurchase(purchase);
           }
-          await _loadData();
-          if (mounted && (wasRequested || purchase.status == PurchaseStatus.purchased)) {
+          hasCompletedPurchases = true;
+          if (mounted && (wasRequested || isRestore)) {
             final notificationKey = transactionKey;
             if (_purchaseNotificationsShown.add(notificationKey)) {
-              _showMessage('Your App Store subscription is active.');
+              _showMessage(
+                isRestore
+                    ? 'Your App Store subscription was restored.'
+                    : 'Your App Store subscription is active.',
+              );
             }
           }
         } catch (e) {
           debugPrint('Error completing purchase: $e');
         } finally {
           _purchaseTimeout?.cancel();
-          if (mounted) setState(() => _isProcessing = false);
+          _restoreRequestWindow?.cancel();
+          if (mounted) {
+            setState(() {
+              _processingPlanId = null;
+              _isProcessing = false;
+              _isRestoringPurchases = false;
+            });
+          }
         }
       }
+    }
+
+    // Refresh subscription status quietly without tearing down the UI
+    if (hasCompletedPurchases) {
+      await _loadData(silent: true);
     }
   }
 
@@ -214,36 +253,74 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
       return;
     }
     _requestedProductIds.add(productId);
-    setState(() => _isProcessing = true);
+    setState(() {
+      _processingPlanId = plan.id;
+      _isProcessing = true;
+    });
     _purchaseTimeout?.cancel();
-    _purchaseTimeout = Timer(const Duration(seconds: 25), () {
+    _purchaseTimeout = Timer(const Duration(seconds: 30), () {
       if (mounted && _isProcessing) {
-        setState(() => _isProcessing = false);
+        setState(() {
+          _processingPlanId = null;
+          _isProcessing = false;
+        });
       }
     });
     try {
-      await _store.buyNonConsumable(purchaseParam: PurchaseParam(productDetails: product));
+      final started = await _store.buyNonConsumable(
+        purchaseParam: PurchaseParam(productDetails: product),
+      );
+      if (!started) {
+        _purchaseTimeout?.cancel();
+        _requestedProductIds.remove(productId);
+        if (mounted) {
+          setState(() {
+            _processingPlanId = null;
+            _isProcessing = false;
+          });
+          _showMessage('Could not start the App Store purchase. Please try again.');
+        }
+      }
     } catch (error) {
       _purchaseTimeout?.cancel();
       _requestedProductIds.remove(productId);
       if (mounted) {
-        setState(() => _isProcessing = false);
-        _showMessage('Could not start the App Store purchase. Please try again.');
+        setState(() {
+          _processingPlanId = null;
+          _isProcessing = false;
+        });
+        _showMessage('Could not start the App Store purchase: ${error.toString().replaceFirst('Bad state: ', '')}');
       }
     }
   }
 
   Future<void> _restoreApplePurchases() async {
-    setState(() => _isProcessing = true);
+    setState(() {
+      _isRestoringPurchases = true;
+      _isProcessing = true;
+    });
     try {
-      // Let an explicit restore retry transactions that failed earlier.
       _handledPurchaseUpdates.clear();
       _restoreRequestWindow?.cancel();
+      _restoreRequestWindow = Timer(const Duration(seconds: 15), () {
+        if (mounted && _isRestoringPurchases) {
+          setState(() {
+            _isRestoringPurchases = false;
+            _isProcessing = false;
+          });
+          _showMessage('Restore process finished.');
+        }
+      });
       await _store.restorePurchases();
-      if (mounted) setState(() => _isProcessing = false);
     } catch (error) {
-      if (mounted) _showMessage('Could not restore purchases. Please try again.');
-      if (mounted) setState(() => _isProcessing = false);
+      _restoreRequestWindow?.cancel();
+      if (mounted) {
+        setState(() {
+          _isRestoringPurchases = false;
+          _isProcessing = false;
+        });
+        _showMessage('Could not restore purchases. Please try again.');
+      }
     }
   }
 
@@ -265,11 +342,14 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
   }
 
   void _showMessage(String message) {
+    if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
   }
 
-  Future<void> _loadData() async {
-    if (mounted) setState(() => _isLoading = true);
+  Future<void> _loadData({bool silent = false}) async {
+    if (!silent && _plans.isEmpty && mounted) {
+      setState(() => _isLoading = true);
+    }
     
     final user = FirebaseAuth.instance.currentUser;
     if (user != null) {
@@ -327,33 +407,66 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
                       const SizedBox(height: 12),
                       Text(_storeError!, style: const TextStyle(color: Colors.orangeAccent)),
                     ],
-                    const SizedBox(height: 12),
+                    const SizedBox(height: 16),
                     Center(
                       child: Wrap(
                         alignment: WrapAlignment.center,
-                        spacing: 24,
+                        spacing: 16,
+                        runSpacing: 4,
                         children: [
                           TextButton(
                             onPressed: _isProcessing ? null : _restoreApplePurchases,
-                            child: const Text('Restore Purchases'),
+                            style: TextButton.styleFrom(
+                              foregroundColor: Colors.white70,
+                              disabledForegroundColor: Colors.white30,
+                            ),
+                            child: _isRestoringPurchases
+                                ? const Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      SizedBox(
+                                        width: 12,
+                                        height: 12,
+                                        child: CircularProgressIndicator(
+                                          strokeWidth: 1.5,
+                                          color: Colors.white70,
+                                        ),
+                                      ),
+                                      SizedBox(width: 8),
+                                      Text('Restoring…', style: TextStyle(color: Colors.white70, fontSize: 13)),
+                                    ],
+                                  )
+                                : const Text('Restore Purchases', style: TextStyle(fontSize: 13)),
                           ),
                           TextButton(
-                            onPressed: _manageAppleSubscriptions,
-                            child: const Text('Manage Subscription'),
+                            onPressed: _isProcessing ? null : _manageAppleSubscriptions,
+                            style: TextButton.styleFrom(
+                              foregroundColor: Colors.white70,
+                              disabledForegroundColor: Colors.white30,
+                            ),
+                            child: const Text('Manage Subscription', style: TextStyle(fontSize: 13)),
                           ),
                           TextButton(
                             onPressed: () => CommunitySafetyHelper.showEula(context),
-                            child: const Text('Terms of Use'),
+                            style: TextButton.styleFrom(
+                              foregroundColor: Colors.white70,
+                              disabledForegroundColor: Colors.white30,
+                            ),
+                            child: const Text('Terms of Use', style: TextStyle(fontSize: 13)),
                           ),
                           if (_privacyPolicyUrl.isNotEmpty)
                             TextButton(
                               onPressed: _openPrivacyPolicy,
-                              child: const Text('Privacy Policy'),
+                              style: TextButton.styleFrom(
+                                foregroundColor: Colors.white70,
+                                disabledForegroundColor: Colors.white30,
+                              ),
+                              child: const Text('Privacy Policy', style: TextStyle(fontSize: 13)),
                             ),
                         ],
                       ),
                     ),
-                    const SizedBox(height: 8),
+                    const SizedBox(height: 12),
                     const Text(
                       'Payment will be charged to your Apple Account at confirmation. Subscriptions renew automatically unless canceled at least 24 hours before the current period ends. Your account will be charged for renewal within 24 hours before the period ends. Manage or cancel in Apple Account settings.',
                       textAlign: TextAlign.center,
@@ -367,7 +480,11 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
   }
 
   Widget _buildCurrentPlanInfo() {
-    if (_currentSubscription == null) {
+    final hasActiveSub = _currentSubscription != null &&
+        _currentSubscription!.isActive &&
+        !_currentSubscription!.isExpired;
+
+    if (!hasActiveSub) {
       return Container(
         padding: const EdgeInsets.all(20),
         decoration: BoxDecoration(
@@ -392,7 +509,7 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
 
     final currentPlan = _plans.firstWhere(
       (p) => p.id == _currentSubscription!.planId,
-      orElse: () => _plans[0],
+      orElse: () => _plans.firstWhere((p) => p.id == 'premium', orElse: () => _plans[0]),
     );
 
     return Container(
@@ -444,10 +561,16 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
   }
 
   Widget _buildPlanCard(SubscriptionPlan plan) {
-    final isCurrentPlan = _currentSubscription?.planId == plan.id ||
-        (_usesAppleIap && _currentSubscription == null && plan.id == 'free');
-    final isUpgrade = _currentSubscription != null && 
-                      plan.price > _plans.firstWhere((p) => p.id == _currentSubscription!.planId).price;
+    final hasActiveSub = _currentSubscription != null &&
+        _currentSubscription!.isActive &&
+        !_currentSubscription!.isExpired;
+    final activePlanId = hasActiveSub ? _currentSubscription!.planId : 'free';
+    final isCurrentPlan = activePlanId == plan.id;
+    final currentPlanPrice = _plans.firstWhere(
+      (p) => p.id == activePlanId,
+      orElse: () => _plans[0],
+    ).price;
+    final isUpgrade = plan.price > currentPlanPrice;
 
     return Container(
       margin: const EdgeInsets.only(bottom: 16),
@@ -472,7 +595,7 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
             children: [
               Text(
                 plan.name,
-                style: TextStyle(
+                style: const TextStyle(
                   color: Colors.white,
                   fontSize: 22,
                   fontWeight: FontWeight.bold,
@@ -590,20 +713,27 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
     final color = isUpgrade ? AppTheme.primary : Colors.blue;
     final appleProductReady = !_usesAppleIap ||
         (_storeAvailable && _storeProducts.containsKey(_appleProductIdForPlan(plan.id)));
+    final isThisPlanProcessing = _isProcessing && _processingPlanId == plan.id;
 
     return InkWell(
       onTap: _isProcessing || !appleProductReady
           ? null
           : () => _usesAppleIap ? _buyApplePlan(plan) : _showPaymentDialog(plan),
-      child: Container(
+      borderRadius: BorderRadius.circular(12),
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 200),
         width: double.infinity,
         padding: const EdgeInsets.symmetric(vertical: 16),
         decoration: BoxDecoration(
-          color: _isProcessing || !appleProductReady ? Colors.white.withOpacity(0.1) : color,
+          color: !appleProductReady
+              ? Colors.white.withOpacity(0.08)
+              : isThisPlanProcessing
+                  ? color.withOpacity(0.7)
+                  : (_isProcessing ? color.withOpacity(0.4) : color),
           borderRadius: BorderRadius.circular(12),
         ),
         child: Center(
-          child: _isProcessing
+          child: isThisPlanProcessing
               ? const SizedBox(
                   height: 20,
                   width: 20,
@@ -618,8 +748,8 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
                           ? 'Not available'
                           : 'Loading App Store…')
                       : _usesAppleIap ? 'Subscribe with Apple' : label,
-                  style: const TextStyle(
-                    color: Colors.white,
+                  style: TextStyle(
+                    color: !appleProductReady ? Colors.white38 : Colors.white,
                     fontSize: 16,
                     fontWeight: FontWeight.bold,
                   ),
@@ -694,7 +824,7 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
                 ),
                 child: Row(
                   children: [
-                    Icon(LucideIcons.shield, size: 16, color: Colors.white38),
+                    const Icon(LucideIcons.shield, size: 16, color: Colors.white38),
                     const SizedBox(width: 8),
                     Expanded(
                       child: Text(
@@ -737,7 +867,7 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
 
                 if (mounted) {
                   setState(() => _isProcessing = false);
-                  _loadData();
+                  _loadData(silent: true);
                   ScaffoldMessenger.of(context).showSnackBar(
                     SnackBar(
                       content: Text('Successfully upgraded to ${plan.name}!'),

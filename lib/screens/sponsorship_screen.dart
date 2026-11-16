@@ -236,19 +236,64 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
       throw Exception(_applePurchaseError ??
           'This tier does not use an available App Store sponsor plan.');
     }
+    // Auto-clear any abandoned stale pending reservation for this product
+    try {
+      await _service.cancelPendingAppleSponsorship(matched.key);
+    } catch (_) {}
+
     await _service.startAppleSponsorship(
       tierId: tierId,
       productId: matched.key,
       durationMonths: _durationMonths,
     );
     if (mounted) setState(() => _applePurchasePending = true);
-    final started = await _store.buyNonConsumable(
-      purchaseParam: PurchaseParam(productDetails: matched.value),
-    );
+    bool started = false;
+    try {
+      started = await _store.buyNonConsumable(
+        purchaseParam: PurchaseParam(productDetails: matched.value),
+      );
+    } catch (e) {
+      debugPrint('StoreKit buyNonConsumable failed: $e');
+      started = false;
+    }
     if (!started) {
-      await _service.cancelPendingAppleSponsorship(matched.key);
+      try {
+        await _service.cancelPendingAppleSponsorship(matched.key);
+      } catch (_) {}
       if (mounted) setState(() => _applePurchasePending = false);
       throw Exception('The App Store purchase did not start. Try again.');
+    }
+  }
+
+  Future<void> _cancelPendingReservation(String docId, String? appleProductId) async {
+    await _run('cancel_$docId', () async {
+      if (appleProductId != null && appleProductId.isNotEmpty) {
+        await _service.cancelPendingAppleSponsorship(appleProductId);
+      }
+      _message('Reservation canceled.');
+    });
+  }
+
+  Future<void> _resumeApplePayment(String productId) async {
+    final product = _appleProducts[productId];
+    if (product == null) {
+      _message('Apple product details are not ready. Please try again.');
+      return;
+    }
+    if (mounted) setState(() => _applePurchasePending = true);
+    try {
+      final started = await _store.buyNonConsumable(
+        purchaseParam: PurchaseParam(productDetails: product),
+      );
+      if (!started && mounted) {
+        setState(() => _applePurchasePending = false);
+        _message('Apple purchase could not be started.');
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _applePurchasePending = false);
+        _message('Purchase error: ${e.toString().replaceFirst('Exception: ', '')}');
+      }
     }
   }
 
@@ -812,6 +857,48 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
                 const SizedBox(height: 12),
                 Text('Artwork · ${_humanStatus(artworkStatus)}',
                     style: const TextStyle(color: Color(0xFFC7C7CF), fontSize: 13)),
+                if (status == 'PENDING_PAYMENT') ...[
+                  const SizedBox(height: 12),
+                  Row(
+                    children: [
+                      if (_requiresAppleIap && data['appleProductId'] is String) ...[
+                        Expanded(
+                          child: FilledButton.icon(
+                            style: FilledButton.styleFrom(
+                              backgroundColor: AppTheme.primary,
+                              foregroundColor: Colors.white,
+                              padding: const EdgeInsets.symmetric(vertical: 10),
+                            ),
+                            onPressed: _busyKey == 'pay_${doc.id}' || _applePurchasePending
+                                ? null
+                                : () => _resumeApplePayment(data['appleProductId'] as String),
+                            icon: _busyKey == 'pay_${doc.id}'
+                                ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                                : const Icon(LucideIcons.creditCard, size: 14),
+                            label: const Text('Pay now', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                      ],
+                      Expanded(
+                        child: OutlinedButton.icon(
+                          style: OutlinedButton.styleFrom(
+                            foregroundColor: Colors.redAccent.shade100,
+                            side: BorderSide(color: Colors.redAccent.withOpacity(0.4)),
+                            padding: const EdgeInsets.symmetric(vertical: 10),
+                          ),
+                          onPressed: _busyKey == 'cancel_${doc.id}' || _applePurchasePending
+                              ? null
+                              : () => _cancelPendingReservation(doc.id, data['appleProductId'] as String?),
+                          icon: _busyKey == 'cancel_${doc.id}'
+                              ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.redAccent))
+                              : const Icon(LucideIcons.xCircle, size: 14),
+                          label: const Text('Cancel', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
                 if (status == 'ACTIVE' && artworkStatus != 'APPROVED') ...[
                   const SizedBox(height: 12),
                   SizedBox(
