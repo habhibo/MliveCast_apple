@@ -92,7 +92,12 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
     try {
       final available = await _store.isAvailable();
       if (!available) {
-        if (mounted) setState(() => _storeError = 'The App Store is not available right now.');
+        if (mounted) {
+          setState(() {
+            _storeAvailable = false;
+            _storeError = 'The App Store is unavailable on this device.';
+          });
+        }
         return;
       }
       final response = await _store.queryProductDetails(
@@ -103,8 +108,12 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
           _storeAvailable = true;
           _storeProducts = {for (final product in response.productDetails) product.id: product};
           _storeError = response.error?.message;
-          if (response.productDetails.isEmpty && response.notFoundIDs.isNotEmpty && _storeError == null) {
-            _storeError = 'Subscription products are not available in App Store Connect yet.';
+          if (response.notFoundIDs.isNotEmpty) {
+            _storeError =
+                'App Store products not found: ${response.notFoundIDs.join(', ')}. '
+                'Check their IDs, availability, and the app’s bundle ID in App Store Connect.';
+          } else if (response.productDetails.isEmpty && _storeError == null) {
+            _storeError = 'No Premium products were returned by the App Store.';
           }
         });
       }
@@ -154,7 +163,13 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
       if (purchase.status == PurchaseStatus.purchased ||
           purchase.status == PurchaseStatus.restored) {
         final wasRequested = _requestedProductIds.remove(purchase.productID);
-        final isRestore = purchase.status == PurchaseStatus.restored || _isRestoringPurchases;
+        final isRestore = _isRestoringPurchases;
+        if (purchase.status == PurchaseStatus.restored && !_isRestoringPurchases) {
+          if (purchase.pendingCompletePurchase) {
+            await _store.completePurchase(purchase);
+          }
+          continue;
+        }
 
         if (!_handledPurchaseUpdates.add(transactionKey)) {
           if (purchase.pendingCompletePurchase) {
@@ -167,41 +182,19 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
           continue;
         }
 
-        bool backendSuccess = false;
         try {
           await _appleSubscriptions.verifyAndActivate(
             purchase.verificationData.serverVerificationData,
           );
-          backendSuccess = true;
         } catch (error) {
           debugPrint('Backend Apple subscription verification failed: $error');
-        }
-
-        // Direct client fallback: if backend verification failed or was unreachable,
-        // activate premium in Firestore since Apple confirmed the purchase.
-        if (!backendSuccess) {
-          try {
-            final currentUser = FirebaseAuth.instance.currentUser;
-            if (currentUser != null) {
-              final planId = AppleSubscriptionService.productToPlan[purchase.productID] ?? 'premium';
-              await FirebaseFirestore.instance.collection('users').doc(currentUser.uid).set({
-                'subscriptionLevel': 'premium',
-              }, SetOptions(merge: true));
-              await FirebaseFirestore.instance.collection('user_subscriptions').doc(currentUser.uid).set({
-                'userId': currentUser.uid,
-                'planId': planId,
-                'status': 'active',
-                'autoRenew': true,
-                'paymentProvider': 'apple',
-                'appleProductId': purchase.productID,
-                'appleTransactionId': purchase.purchaseID ?? '',
-                'updatedAt': FieldValue.serverTimestamp(),
-              }, SetOptions(merge: true));
-              backendSuccess = true;
-            }
-          } catch (e) {
-            debugPrint('Client fallback subscription update failed: $e');
+          if (mounted && (wasRequested || isRestore)) {
+            _showMessage(
+              'Apple completed the purchase, but the app could not verify it yet. '
+              'Your plan will update after verification; use Restore Purchases to retry.',
+            );
           }
+          continue;
         }
 
         try {
@@ -292,6 +285,26 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
         _showMessage('Could not start the App Store purchase: ${error.toString().replaceFirst('Bad state: ', '')}');
       }
     }
+  }
+
+  Future<void> _onPlanTap(SubscriptionPlan plan) async {
+    if (!_usesAppleIap) {
+      _showPaymentDialog(plan);
+      return;
+    }
+    final productId = _appleProductIdForPlan(plan.id);
+    if (!_storeAvailable || productId == null || !_storeProducts.containsKey(productId)) {
+      await _loadAppleProducts();
+      if (!mounted) return;
+      final refreshedProductId = _appleProductIdForPlan(plan.id);
+      if (!_storeAvailable ||
+          refreshedProductId == null ||
+          !_storeProducts.containsKey(refreshedProductId)) {
+        _showMessage(_storeError ?? 'This Apple subscription is unavailable.');
+        return;
+      }
+    }
+    await _buyApplePlan(plan);
   }
 
   Future<void> _restoreApplePurchases() async {
@@ -716,9 +729,7 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
     final isThisPlanProcessing = _isProcessing && _processingPlanId == plan.id;
 
     return InkWell(
-      onTap: _isProcessing || !appleProductReady
-          ? null
-          : () => _usesAppleIap ? _buyApplePlan(plan) : _showPaymentDialog(plan),
+      onTap: _isProcessing ? null : () => _onPlanTap(plan),
       borderRadius: BorderRadius.circular(12),
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 200),

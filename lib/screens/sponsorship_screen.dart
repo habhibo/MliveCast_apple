@@ -161,18 +161,26 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
       }
       if (purchase.status != PurchaseStatus.purchased &&
           purchase.status != PurchaseStatus.restored) continue;
+      var verified = false;
       try {
         await _service.verifyAppleSponsorship(
             purchase.verificationData.serverVerificationData);
+        verified = true;
         if (mounted && purchase.status == PurchaseStatus.purchased) {
           _message('Sponsorship payment confirmed.');
         }
       } catch (error) {
         if (mounted) {
-          _message(error.toString().replaceFirst('Exception: ', ''));
+          _message(
+            'Apple completed the purchase, but Mlivecast could not verify it yet. '
+            'Keep this screen open or tap Restore purchase to retry. '
+            '${error.toString().replaceFirst('Exception: ', '')}',
+          );
         }
       } finally {
-        if (purchase.pendingCompletePurchase) {
+        // Do not finish StoreKit's transaction until the backend has verified
+        // and applied it. An unfinished transaction is redelivered by StoreKit.
+        if (verified && purchase.pendingCompletePurchase) {
           await _store.completePurchase(purchase);
         }
         if (mounted) setState(() => _applePurchasePending = false);
@@ -282,13 +290,10 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
     }
     if (mounted) setState(() => _applePurchasePending = true);
     try {
-      final started = await _store.buyNonConsumable(
-        purchaseParam: PurchaseParam(productDetails: product),
-      );
-      if (!started && mounted) {
-        setState(() => _applePurchasePending = false);
-        _message('Apple purchase could not be started.');
-      }
+      // This item already has a pending server reservation. Ask StoreKit to
+      // replay an existing transaction first; attempting to buy the same
+      // non-consumable again may show no purchase sheet at all.
+      await _store.restorePurchases();
     } catch (e) {
       if (mounted) {
         setState(() => _applePurchasePending = false);
