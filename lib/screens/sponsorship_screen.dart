@@ -588,6 +588,10 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
                 .where((doc) => doc.data()['active'] == true)
                 .length ??
             0;
+        final noTiersConfigured = !waitingForServerSnapshot &&
+            !snapshot.hasError && docs.isEmpty && activeTierCount == 0;
+        final noApplePlanMatch = !waitingForServerSnapshot &&
+            !snapshot.hasError && docs.isEmpty && activeTierCount > 0;
         return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           const _SectionHeading('AVAILABLE TIERS'),
           if (_requiresAppleIap && _applePurchaseError != null)
@@ -597,11 +601,11 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
             const Padding(
               padding: EdgeInsets.symmetric(vertical: 18),
               child: Center(child: CircularProgressIndicator()),
-            )
-          else if (docs.isEmpty && !snapshot.hasError && activeTierCount == 0)
+            ),
+          if (noTiersConfigured)
             const _EmptyMessage(
                 'This station or contest has not set up sponsor tiers yet.'),
-          else if (docs.isEmpty && !snapshot.hasError)
+          if (noApplePlanMatch)
             const _EmptyMessage(
                 'Sponsor tiers exist, but none currently match an available Apple plan.'),
           ...docs.map((doc) => _tierCard(doc.id, doc.data(), ownerControls: false)),
@@ -620,6 +624,8 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
                 (snapshot.data == null ||
                     (snapshot.data!.metadata.isFromCache &&
                         snapshot.data!.docs.isEmpty));
+        final noTiersConfigured = !waitingForServerSnapshot &&
+            !snapshot.hasError && docs.isEmpty;
         return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           Row(children: [
             const Expanded(child: _SectionHeading('YOUR TIERS')),
@@ -637,8 +643,8 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
             const Padding(
               padding: EdgeInsets.symmetric(vertical: 18),
               child: Center(child: CircularProgressIndicator()),
-            )
-          else if (docs.isEmpty && !snapshot.hasError)
+            ),
+          if (noTiersConfigured)
             const _EmptyMessage('Create your first custom sponsor tier.'),
           ...docs.map((doc) => _tierCard(doc.id, doc.data(), ownerControls: true)),
         ]);
