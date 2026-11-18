@@ -274,6 +274,16 @@ exports.verifyAppleSubscription = functions
         const decoded = await admin.auth().verifyIdToken(match[1]);
         const signedTransaction = req.body && req.body.signedTransaction;
         const {transaction} = await verifyTransaction(signedTransaction);
+        const purchaseRequestedAtMillis = Number(
+            req.body && req.body.purchaseRequestedAtMillis);
+        if (Number.isFinite(purchaseRequestedAtMillis) &&
+            Number(transaction.purchaseDate) + 5000 <
+              purchaseRequestedAtMillis) {
+          return res.status(409).json({
+            error: "Apple sent an older transaction, not a new subscription purchase.",
+            code: "APPLE_OLD_TRANSACTION",
+          });
+        }
         if (transaction.revocationDate ||
             Number(transaction.expiresDate) <= Date.now()) {
           return res.status(402).json({
@@ -317,7 +327,8 @@ exports.verifyAppleSponsorship = functions
       } catch (error) {
         console.error("[verifyAppleSponsorship]", error.message);
         const status = error.code === "auth/argument-error" ||
-          error.code === "auth/id-token-expired" ? 401 : 400;
+          error.code === "auth/id-token-expired" ? 401 :
+          error.code === "APPLE_TRANSACTION_REPLAY" ? 409 : 400;
         return res.status(status).json({
           error: error.message || "Sponsorship purchase verification failed",
         });

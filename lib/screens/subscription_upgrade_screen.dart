@@ -31,6 +31,7 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
   final Set<String> _purchaseNotificationsShown = {};
   final Set<String> _handledPurchaseUpdates = {};
   final Set<String> _requestedProductIds = {};
+  final Map<String, int> _purchaseRequestedAtMillis = {};
   Timer? _restoreRequestWindow;
   Timer? _purchaseTimeout;
   bool _isRestoringPurchases = false;
@@ -63,6 +64,17 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
 
   bool get _usesAppleIap =>
       !kIsWeb && defaultTargetPlatform == TargetPlatform.iOS;
+
+  int? _transactionDateMillis(String? value) {
+    if (value == null || value.isEmpty) return null;
+    final numeric = int.tryParse(value);
+    if (numeric != null) {
+      // StoreKit's plugin reports epoch milliseconds. Accept epoch seconds too
+      // for older platform implementations.
+      return numeric < 100000000000 ? numeric * 1000 : numeric;
+    }
+    return DateTime.tryParse(value)?.millisecondsSinceEpoch;
+  }
 
   @override
   void initState() {
@@ -175,8 +187,33 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
       if (purchase.status == PurchaseStatus.purchased ||
           purchase.status == PurchaseStatus.restored) {
         final wasRequested = _requestedProductIds.remove(purchase.productID);
-        final isRestore =
-            purchase.status == PurchaseStatus.restored || _isRestoringPurchases;
+        final requestedAt =
+            _purchaseRequestedAtMillis.remove(purchase.productID);
+        final transactionDate = _transactionDateMillis(purchase.transactionDate);
+        final isRestore = _isRestoringPurchases;
+        // A previously expired transaction can be redelivered while a new
+        // subscribe tap is in flight. Do not mistake that restore for the
+        // purchase the user just requested.
+        if (purchase.status == PurchaseStatus.restored &&
+            !_isRestoringPurchases &&
+            wasRequested &&
+            requestedAt != null &&
+            transactionDate != null &&
+            transactionDate + 5000 < requestedAt) {
+          if (purchase.pendingCompletePurchase) {
+            await _store.completePurchase(purchase);
+          }
+          _purchaseTimeout?.cancel();
+          if (mounted) {
+            setState(() {
+              _processingPlanId = null;
+              _isProcessing = false;
+              _appleFlowStatus =
+                  'Ignored an older Apple transaction for ${purchase.productID}; it did not start a new subscription.';
+            });
+          }
+          continue;
+        }
         // StoreKit can return an existing subscription as `restored` when the
         // user taps Subscribe for a product already associated with this Apple
         // account. Process it when that tap initiated the flow; only ignore
@@ -207,17 +244,21 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
 
         if (mounted) {
           setState(() => _appleFlowStatus =
-              'StoreKit returned ${purchase.status.name} for ${purchase.productID}; verifying with staging.');
+              'Received a StoreKit transaction update (${purchase.status.name}) for ${purchase.productID}; verifying with the server.');
         }
         try {
           await _appleSubscriptions.verifyAndActivate(
             purchase.verificationData.serverVerificationData,
+            purchaseRequestedAtMillis: wasRequested ? requestedAt : null,
           );
         } catch (error) {
           debugPrint('Backend Apple subscription verification failed: $error');
           final inactiveTransaction =
               error is AppleSubscriptionInactiveException;
-          if (inactiveTransaction && purchase.pendingCompletePurchase) {
+          final staleTransaction =
+              error is AppleSubscriptionStaleTransactionException;
+          if ((inactiveTransaction || staleTransaction) &&
+              purchase.pendingCompletePurchase) {
             // Apple returned a verified but inactive transaction (usually an
             // old expired sandbox subscription). Finish it so StoreKit does
             // not keep replaying it as if it were a new purchase.
@@ -229,7 +270,9 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
           }
           if (mounted) {
             setState(() {
-              _appleFlowStatus = inactiveTransaction
+              _appleFlowStatus = staleTransaction
+                  ? 'Ignored an older Apple transaction. No new purchase completed.'
+                  : inactiveTransaction
                   ? 'Apple returned an expired or revoked transaction. No new purchase completed.'
                   : 'Apple transaction reached the app, but server verification failed: $error';
               _processingPlanId = null;
@@ -238,7 +281,9 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
           }
           if (mounted && (wasRequested || isRestore)) {
             _showMessage(
-              inactiveTransaction
+              staleTransaction
+                  ? 'Apple sent an older transaction from before this purchase attempt. It was ignored; tap Subscribe to start a new purchase.'
+                  : inactiveTransaction
                   ? 'Apple returned an expired or revoked subscription. No new purchase was completed. Tap Subscribe to start a new purchase.'
                   : 'Apple sent a transaction, but Mlivecast could not verify it. Your plan has not changed. Try Restore Purchases later.',
             );
@@ -300,6 +345,7 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
       return;
     }
     _requestedProductIds.add(productId);
+    _purchaseRequestedAtMillis[productId] = DateTime.now().millisecondsSinceEpoch;
     setState(() {
       _processingPlanId = plan.id;
       _isProcessing = true;
@@ -308,6 +354,8 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
     _purchaseTimeout?.cancel();
     _purchaseTimeout = Timer(const Duration(seconds: 30), () {
       if (mounted && _isProcessing) {
+        _requestedProductIds.remove(productId);
+        _purchaseRequestedAtMillis.remove(productId);
         setState(() {
           _processingPlanId = null;
           _isProcessing = false;
@@ -326,6 +374,7 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
       if (!started) {
         _purchaseTimeout?.cancel();
         _requestedProductIds.remove(productId);
+        _purchaseRequestedAtMillis.remove(productId);
         if (mounted) {
           setState(() {
             _processingPlanId = null;
@@ -338,6 +387,7 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
     } catch (error) {
       _purchaseTimeout?.cancel();
       _requestedProductIds.remove(productId);
+      _purchaseRequestedAtMillis.remove(productId);
       if (mounted) {
         setState(() {
           _processingPlanId = null;

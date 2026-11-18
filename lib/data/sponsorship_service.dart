@@ -7,6 +7,22 @@ import 'package:firebase_storage/firebase_storage.dart';
 import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
 
+class AppleSponsorshipReplayException implements Exception {
+  final String message;
+  const AppleSponsorshipReplayException(this.message);
+
+  @override
+  String toString() => message;
+}
+
+class AppleSponsorshipInactiveException implements Exception {
+  final String message;
+  const AppleSponsorshipInactiveException(this.message);
+
+  @override
+  String toString() => message;
+}
+
 class SponsorshipService {
   SponsorshipService._();
 
@@ -145,21 +161,41 @@ class SponsorshipService {
       throw Exception('Could not authenticate this purchase.');
     }
     final projectId = Firebase.app().options.projectId;
-    final response = await http.post(
-      Uri.parse(
-        'https://us-central1-$projectId.cloudfunctions.net/verifyAppleSponsorship',
-      ),
-      headers: {
-        'Authorization': 'Bearer $token',
-        'Content-Type': 'application/json',
-      },
-      body: jsonEncode({'signedTransaction': signedTransaction}),
-    );
-    final body = jsonDecode(response.body) as Map<String, dynamic>;
-    if (response.statusCode < 200 || response.statusCode >= 300) {
+    final response = await http
+        .post(
+          Uri.parse(
+            'https://us-central1-$projectId.cloudfunctions.net/verifyAppleSponsorship',
+          ),
+          headers: {
+            'Authorization': 'Bearer $token',
+            'Content-Type': 'application/json',
+          },
+          body: jsonEncode({'signedTransaction': signedTransaction}),
+        )
+        .timeout(const Duration(seconds: 30));
+    Map<String, dynamic> body;
+    try {
+      final decoded = jsonDecode(response.body);
+      if (decoded is! Map<String, dynamic>) {
+        throw const FormatException('Expected a JSON object.');
+      }
+      body = decoded;
+    } on FormatException {
       throw Exception(
-        body['error'] as String? ?? 'Could not verify this Apple purchase.',
+        'Apple verification returned an invalid response '
+        '(HTTP ${response.statusCode}).',
       );
+    }
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      final message =
+          body['error'] as String? ?? 'Could not verify this Apple purchase.';
+      if (response.statusCode == 409) {
+        throw AppleSponsorshipReplayException(message);
+      }
+      if (response.statusCode == 402) {
+        throw AppleSponsorshipInactiveException(message);
+      }
+      throw Exception(message);
     }
   }
 

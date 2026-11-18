@@ -207,9 +207,10 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
       if (purchase.status != PurchaseStatus.purchased &&
           purchase.status != PurchaseStatus.restored) continue;
       var verified = false;
+      var finalTransactionRejected = false;
       if (mounted) {
         setState(() => _appleFlowStatus =
-            'StoreKit returned ${purchase.status.name} for ${purchase.productID}; verifying with staging.');
+            'Received a StoreKit transaction update (${purchase.status.name}) for ${purchase.productID}; verifying with the server.');
       }
       try {
         await _service.verifyAppleSponsorship(
@@ -220,19 +221,21 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
           _message('Sponsorship payment confirmed.');
         }
       } catch (error) {
+        finalTransactionRejected =
+            error is AppleSponsorshipReplayException ||
+                error is AppleSponsorshipInactiveException;
         if (mounted) {
           setState(() => _appleFlowStatus =
               'Apple transaction reached the app, but server verification failed: ${error.toString()}');
-          _message(
-            'Apple completed the purchase, but Mlivecast could not verify it yet. '
-            'Keep this screen open or tap Restore purchase to retry. '
-            '${error.toString().replaceFirst('Exception: ', '')}',
-          );
+          _message(finalTransactionRejected
+              ? '${error.toString().replaceFirst('Exception: ', '')} No new sponsorship was charged.'
+              : 'Apple sent a transaction, but Mlivecast could not verify it yet. Keep this screen open and retry after the service recovers. ${error.toString().replaceFirst('Exception: ', '')}');
         }
       } finally {
-        // Do not finish StoreKit's transaction until the backend has verified
-        // and applied it. An unfinished transaction is redelivered by StoreKit.
-        if (verified && purchase.pendingCompletePurchase) {
+        // Finish only after the backend accepted the transaction or confirmed
+        // a final replay/refund. Other failures stay pending for retry.
+        if ((verified || finalTransactionRejected) &&
+            purchase.pendingCompletePurchase) {
           await _store.completePurchase(purchase);
         }
         if (mounted) setState(() => _applePurchasePending = false);
@@ -310,7 +313,10 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
     if (mounted) setState(() => _appleFlowStatus = storeKitCallStatus);
     bool started = false;
     try {
-      started = await _store.buyNonConsumable(
+      // Sponsorship slots are repeatable purchases. Store them as App Store
+      // consumables so the same sponsor plan can be purchased again for a
+      // different station/contest. Non-consumables are restored instead.
+      started = await _store.buyConsumable(
         purchaseParam: PurchaseParam(productDetails: matched.value),
       );
       if (mounted && _appleFlowStatus == storeKitCallStatus) {
@@ -321,7 +327,7 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
         });
       }
     } catch (e) {
-      debugPrint('StoreKit buyNonConsumable failed: $e');
+      debugPrint('StoreKit buyConsumable failed: $e');
       if (mounted) setState(() => _appleFlowStatus = 'StoreKit call failed: $e');
       started = false;
     }
@@ -351,7 +357,7 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
     }
     if (mounted) setState(() => _applePurchasePending = true);
     try {
-      final started = await _store.buyNonConsumable(
+      final started = await _store.buyConsumable(
         purchaseParam: PurchaseParam(productDetails: product),
       );
       if (!started && mounted) {
@@ -573,15 +579,31 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
           return true;
         }).toList() ?? [];
         docs.sort((a, b) => (a.data()['price'] as num? ?? 0).compareTo(b.data()['price'] as num? ?? 0));
+        final waitingForServerSnapshot =
+            !snapshot.hasError &&
+                (snapshot.data == null ||
+                    (snapshot.data!.metadata.isFromCache &&
+                        snapshot.data!.docs.isEmpty));
+        final activeTierCount = snapshot.data?.docs
+                .where((doc) => doc.data()['active'] == true)
+                .length ??
+            0;
         return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           const _SectionHeading('AVAILABLE TIERS'),
           if (_requiresAppleIap && _applePurchaseError != null)
             _EmptyMessage(_applePurchaseError!),
           if (snapshot.hasError) const _EmptyMessage('Could not load sponsor tiers.'),
-          if (docs.isEmpty && !snapshot.hasError)
-            _EmptyMessage(_requiresAppleIap
-                ? 'No sponsor tiers have a matching Apple price option yet.'
-                : 'No sponsor tiers are available yet.'),
+          if (waitingForServerSnapshot)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 18),
+              child: Center(child: CircularProgressIndicator()),
+            )
+          else if (docs.isEmpty && !snapshot.hasError && activeTierCount == 0)
+            const _EmptyMessage(
+                'This station or contest has not set up sponsor tiers yet.'),
+          else if (docs.isEmpty && !snapshot.hasError)
+            const _EmptyMessage(
+                'Sponsor tiers exist, but none currently match an available Apple plan.'),
           ...docs.map((doc) => _tierCard(doc.id, doc.data(), ownerControls: false)),
         ]);
       },
@@ -593,6 +615,11 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
       stream: _tiersStream,
       builder: (context, snapshot) {
         final docs = snapshot.data?.docs ?? [];
+        final waitingForServerSnapshot =
+            !snapshot.hasError &&
+                (snapshot.data == null ||
+                    (snapshot.data!.metadata.isFromCache &&
+                        snapshot.data!.docs.isEmpty));
         return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           Row(children: [
             const Expanded(child: _SectionHeading('YOUR TIERS')),
@@ -606,7 +633,13 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
             ),
           ]),
           if (snapshot.hasError) const _EmptyMessage('Could not load your tiers.'),
-          if (docs.isEmpty && !snapshot.hasError) const _EmptyMessage('Create your first custom sponsor tier.'),
+          if (waitingForServerSnapshot)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 18),
+              child: Center(child: CircularProgressIndicator()),
+            )
+          else if (docs.isEmpty && !snapshot.hasError)
+            const _EmptyMessage('Create your first custom sponsor tier.'),
           ...docs.map((doc) => _tierCard(doc.id, doc.data(), ownerControls: true)),
         ]);
       },

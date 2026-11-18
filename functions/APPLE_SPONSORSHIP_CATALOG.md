@@ -20,6 +20,15 @@ document has `appStoreConnectAppleId` (string), `priceCents` (number), and
 Product ID strings. The `active` field is optional: a missing field means the
 product is available, while `active: false` disables it.
 
+**App Store Connect product type:** each sponsorship SKU must be a **consumable**.
+A sponsor can buy the same tier again for a different contest or station.
+Non-consumable SKUs restore their prior transaction instead of supporting
+repeat purchases. Apple does not let you change a product's type after it is
+created. If an existing SKU is non-consumable, create a new consumable SKU, then
+use its exact product ID as the Firestore product document ID and update the
+`appleProductId` field on the matching `sponsor_tiers` documents. Keep its price
+and `ownerTypes` aligned with the tier.
+
 ## Seed the staging catalog
 
 The easiest option is to create the six documents in the Firebase Console:
