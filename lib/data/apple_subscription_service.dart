@@ -4,6 +4,14 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
+class AppleSubscriptionInactiveException implements Exception {
+  final String message;
+  const AppleSubscriptionInactiveException(this.message);
+
+  @override
+  String toString() => message;
+}
+
 /// Sends StoreKit's signed transaction to the trusted backend for verification.
 /// Firestore entitlements are written by the backend only after Apple's JWS is
 /// verified; the client never grants premium access from a local callback.
@@ -40,6 +48,11 @@ class AppleSubscriptionService {
       body: jsonEncode({'signedTransaction': signedTransaction}),
     );
 
+    if (response.statusCode == 402) {
+      throw const AppleSubscriptionInactiveException(
+        'Apple returned an expired or revoked subscription transaction.',
+      );
+    }
     if (response.statusCode < 200 || response.statusCode >= 300) {
       String message = 'Could not verify the App Store purchase.';
       try {

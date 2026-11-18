@@ -215,17 +215,32 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
           );
         } catch (error) {
           debugPrint('Backend Apple subscription verification failed: $error');
+          final inactiveTransaction =
+              error is AppleSubscriptionInactiveException;
+          if (inactiveTransaction && purchase.pendingCompletePurchase) {
+            // Apple returned a verified but inactive transaction (usually an
+            // old expired sandbox subscription). Finish it so StoreKit does
+            // not keep replaying it as if it were a new purchase.
+            try {
+              await _store.completePurchase(purchase);
+            } catch (finishError) {
+              debugPrint('Could not finish inactive Apple transaction: $finishError');
+            }
+          }
           if (mounted) {
             setState(() {
-              _appleFlowStatus = 'Apple transaction reached the app, but server verification failed: $error';
+              _appleFlowStatus = inactiveTransaction
+                  ? 'Apple returned an expired or revoked transaction. No new purchase completed.'
+                  : 'Apple transaction reached the app, but server verification failed: $error';
               _processingPlanId = null;
               _isProcessing = false;
             });
           }
           if (mounted && (wasRequested || isRestore)) {
             _showMessage(
-              'Apple completed the purchase, but the app could not verify it yet. '
-              'Your plan will update after verification; use Restore Purchases to retry.',
+              inactiveTransaction
+                  ? 'Apple returned an expired or revoked subscription. No new purchase was completed. Tap Subscribe to start a new purchase.'
+                  : 'Apple sent a transaction, but Mlivecast could not verify it. Your plan has not changed. Try Restore Purchases later.',
             );
           }
           continue;

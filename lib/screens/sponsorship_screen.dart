@@ -79,8 +79,10 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
         _handleApplePurchases,
         onError: (Object error) {
           if (mounted) {
-            setState(() => _applePurchaseError =
-                'Apple purchases are unavailable right now.');
+            setState(() {
+              _applePurchaseError = 'Apple purchases are unavailable right now.';
+              _appleFlowStatus = 'StoreKit purchase stream error: $error';
+            });
           }
         },
       );
@@ -166,7 +168,13 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
 
   Future<void> _handleApplePurchases(List<PurchaseDetails> purchases) async {
     for (final purchase in purchases) {
-      if (!_appleCatalog.containsKey(purchase.productID)) continue;
+      if (!_appleCatalog.containsKey(purchase.productID)) {
+        if (mounted) {
+          setState(() => _appleFlowStatus =
+              'StoreKit sent ${purchase.status.name} for ${purchase.productID}, but that product is not in the loaded sponsorship catalog.');
+        }
+        continue;
+      }
       if (purchase.status == PurchaseStatus.pending) {
         if (mounted) {
           setState(() {
@@ -297,19 +305,20 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
       durationMonths: _durationMonths,
     );
     if (mounted) setState(() => _applePurchasePending = true);
-    if (mounted) {
-      setState(() => _appleFlowStatus =
-          'Reservation created. Calling StoreKit for ${matched.key}…');
-    }
+    final storeKitCallStatus =
+        'Reservation created. Calling StoreKit for ${matched.key}…';
+    if (mounted) setState(() => _appleFlowStatus = storeKitCallStatus);
     bool started = false;
     try {
       started = await _store.buyNonConsumable(
         purchaseParam: PurchaseParam(productDetails: matched.value),
       );
-      if (mounted) {
-        setState(() => _appleFlowStatus = started
-            ? 'StoreKit accepted ${matched.key}; waiting for Apple transaction status.'
-            : 'StoreKit returned false for ${matched.key}.');
+      if (mounted && _appleFlowStatus == storeKitCallStatus) {
+        setState(() {
+          _appleFlowStatus = started
+              ? 'StoreKit accepted ${matched.key}; waiting for Apple transaction status.'
+              : 'StoreKit returned false for ${matched.key}.';
+        });
       }
     } catch (e) {
       debugPrint('StoreKit buyNonConsumable failed: $e');
