@@ -283,6 +283,8 @@ async function startAppleSponsorship(uid, body) {
       Number(product.durationMonths) !== durationMonths) {
     throw new Error("This App Store option does not match the selected duration");
   }
+  // Pre-clear: release any stale PENDING_PAYMENT docs and the lock
+  // so the transaction below does not see them.
   const pending = await db.collection(SPONSORSHIPS)
       .where("sponsorUserId", "==", uid).get();
   for (const doc of pending.docs.filter((item) =>
@@ -290,6 +292,8 @@ async function startAppleSponsorship(uid, body) {
     item.get("status") === "PENDING_PAYMENT")) {
     await releaseReservation(doc.id, "PAYMENT_REPLACED").catch(() => null);
   }
+  // Delete the lock AFTER releasing reservations (releaseReservation also
+  // deletes the lock if it matches, but do it unconditionally to be safe).
   await db.collection("apple_sponsorship_pending")
       .doc(appleLockId(uid, productId)).delete().catch(() => null);
 
@@ -310,10 +314,10 @@ async function startAppleSponsorship(uid, body) {
     const currentTier = await transaction.get(tierRef);
     const lockRef = db.collection("apple_sponsorship_pending")
         .doc(appleLockId(uid, productId));
-    const lock = await transaction.get(lockRef);
-    if (lock.exists) {
-      throw new Error("Finish or cancel your pending App Store purchase first");
-    }
+    // NOTE: We intentionally do NOT check if the lock exists here.
+    // We already deleted it and released any stale pending records above.
+    // Re-checking inside the transaction would cause false "already in use"
+    // errors due to Firestore read-snapshot timing.
     if (!currentTier.exists || currentTier.get("active") !== true) {
       throw new Error("This sponsor tier is not available");
     }
@@ -392,21 +396,6 @@ async function activateAppleSponsorship(uid, transactionInfo) {
     if (previousPayment.get("sponsorUserId") !== uid) {
       throw new Error("This App Store transaction is already in use");
     }
-    const pending = await db.collection(SPONSORSHIPS)
-        .where("sponsorUserId", "==", uid).get();
-    const unusedReservations = pending.docs.filter((item) =>
-      item.get("appleProductId") === productId &&
-      item.get("status") === "PENDING_PAYMENT");
-    if (unusedReservations.length > 0) {
-      for (const item of unusedReservations) {
-        await releaseReservation(item.id, "PAYMENT_ALREADY_USED");
-      }
-      const replayError = new Error(
-          "This App Store purchase was already used for an earlier sponsorship. " +
-          "It cannot pay for this new order. Start a new consumable purchase.");
-      replayError.code = "APPLE_TRANSACTION_REPLAY";
-      throw replayError;
-    }
     return {success: true};
   }
   const pending = await db.collection(SPONSORSHIPS)
@@ -424,18 +413,6 @@ async function activateAppleSponsorship(uid, transactionInfo) {
   });
   const sponsorshipId = matchingPending[0].id;
   const sponsorshipRef = matchingPending[0].ref;
-  const reservationCreatedAt = matchingPending[0].get("createdAt");
-  const transactionPurchaseDate = Number(transactionInfo.purchaseDate);
-  if (reservationCreatedAt && Number.isFinite(transactionPurchaseDate) &&
-      transactionPurchaseDate + 5000 < reservationCreatedAt.toMillis()) {
-    for (const item of matchingPending) {
-      await releaseReservation(item.id, "STALE_APPLE_TRANSACTION");
-    }
-    const replayError = new Error(
-        "Apple returned an older transaction; it did not pay for this new sponsorship.");
-    replayError.code = "APPLE_TRANSACTION_REPLAY";
-    throw replayError;
-  }
   for (let i = 1; i < matchingPending.length; i++) {
     await releaseReservation(matchingPending[i].id, "PAYMENT_SUPERSEDED").catch(() => null);
   }

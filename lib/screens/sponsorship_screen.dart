@@ -37,6 +37,7 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
   StreamSubscription<List<PurchaseDetails>>? _purchaseUpdates;
   final Map<String, Map<String, dynamic>> _appleCatalog = {};
   final Map<String, ProductDetails> _appleProducts = {};
+  final Set<String> _requestedSponsorProductIds = {};
   int _durationMonths = 1;
   String? _busyKey;
   bool _applePurchasePending = false;
@@ -140,27 +141,47 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
   Future<void> _handleApplePurchases(List<PurchaseDetails> purchases) async {
     for (final purchase in purchases) {
       if (!_appleCatalog.containsKey(purchase.productID)) continue;
+
       if (purchase.status == PurchaseStatus.pending) {
-        if (mounted) setState(() => _applePurchasePending = true);
+        // Only block the UI for products the user explicitly tapped.
+        // Startup-replayed orphaned pending transactions must NOT disable buttons.
+        if (_requestedSponsorProductIds.contains(purchase.productID)) {
+          if (mounted) setState(() => _applePurchasePending = true);
+        }
         continue;
       }
+
       if (purchase.status == PurchaseStatus.canceled ||
           purchase.status == PurchaseStatus.error) {
-        await _service.cancelPendingAppleSponsorship(purchase.productID);
+        _requestedSponsorProductIds.remove(purchase.productID);
+        await _service.cancelPendingAppleSponsorship(purchase.productID)
+            .catchError((_) {});
         if (purchase.pendingCompletePurchase) {
-          await _store.completePurchase(purchase);
+          await _store.completePurchase(purchase).catchError((_) {});
         }
         if (mounted) {
           setState(() => _applePurchasePending = false);
-          if (purchase.status == PurchaseStatus.error) {
+          if (purchase.status == PurchaseStatus.error &&
+              _requestedSponsorProductIds.isEmpty) {
             _message(purchase.error?.message ??
                 'The App Store could not complete this purchase.');
           }
         }
         continue;
       }
+
       if (purchase.status != PurchaseStatus.purchased &&
           purchase.status != PurchaseStatus.restored) continue;
+
+      // For restored events that the user did NOT request: just complete them silently.
+      final wasRequested = _requestedSponsorProductIds.remove(purchase.productID);
+      if (purchase.status == PurchaseStatus.restored && !wasRequested) {
+        if (purchase.pendingCompletePurchase) {
+          await _store.completePurchase(purchase).catchError((_) {});
+        }
+        continue;
+      }
+
       try {
         await _service.verifyAppleSponsorship(
             purchase.verificationData.serverVerificationData);
@@ -173,7 +194,7 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
         }
       } finally {
         if (purchase.pendingCompletePurchase) {
-          await _store.completePurchase(purchase);
+          await _store.completePurchase(purchase).catchError((_) {});
         }
         if (mounted) setState(() => _applePurchasePending = false);
       }
@@ -246,6 +267,7 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
       productId: matched.key,
       durationMonths: _durationMonths,
     );
+    _requestedSponsorProductIds.add(matched.key);
     if (mounted) setState(() => _applePurchasePending = true);
     bool started = false;
     try {
@@ -257,6 +279,7 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
       started = false;
     }
     if (!started) {
+      _requestedSponsorProductIds.remove(matched.key);
       try {
         await _service.cancelPendingAppleSponsorship(matched.key);
       } catch (_) {}
@@ -291,6 +314,7 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
       durationMonths: _durationMonths,
     );
     if (mounted) setState(() => _applePurchasePending = true);
+    _requestedSponsorProductIds.add(appleProductId);
     bool started = false;
     try {
       started = await _store.buyNonConsumable(
@@ -301,6 +325,7 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
       started = false;
     }
     if (!started) {
+      _requestedSponsorProductIds.remove(appleProductId);
       try {
         await _service.cancelPendingAppleSponsorship(appleProductId);
       } catch (_) {}
