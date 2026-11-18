@@ -244,11 +244,6 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
       throw Exception(_applePurchaseError ??
           'This tier does not use an available App Store sponsor plan.');
     }
-    // Auto-clear any abandoned stale pending reservation for this product
-    try {
-      await _service.cancelPendingAppleSponsorship(matched.key);
-    } catch (_) {}
-
     await _service.startAppleSponsorship(
       tierId: tierId,
       productId: matched.key,
@@ -290,10 +285,13 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
     }
     if (mounted) setState(() => _applePurchasePending = true);
     try {
-      // This item already has a pending server reservation. Ask StoreKit to
-      // replay an existing transaction first; attempting to buy the same
-      // non-consumable again may show no purchase sheet at all.
-      await _store.restorePurchases();
+      final started = await _store.buyNonConsumable(
+        purchaseParam: PurchaseParam(productDetails: product),
+      );
+      if (!started && mounted) {
+        setState(() => _applePurchasePending = false);
+        _message('Apple could not start this purchase. Please try again.');
+      }
     } catch (e) {
       if (mounted) {
         setState(() => _applePurchasePending = false);
