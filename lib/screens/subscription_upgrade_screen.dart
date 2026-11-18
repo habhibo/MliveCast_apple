@@ -58,6 +58,7 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
   bool _isProcessing = false;
   bool _storeAvailable = false;
   String? _storeError;
+  String? _appleFlowStatus;
   Map<String, ProductDetails> _storeProducts = {};
 
   bool get _usesAppleIap =>
@@ -107,6 +108,9 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
         setState(() {
           _storeAvailable = true;
           _storeProducts = {for (final product in response.productDetails) product.id: product};
+          _appleFlowStatus = response.productDetails.isEmpty
+              ? 'Apple catalog returned no products. Missing: ${response.notFoundIDs.join(', ')}'
+              : 'Apple catalog ready: ${response.productDetails.length} product(s).';
           _storeError = response.error?.message;
           if (response.notFoundIDs.isNotEmpty) {
             _storeError =
@@ -135,7 +139,12 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
           '${purchase.productID}:${purchase.transactionDate ?? ''}:${purchase.status.name}';
 
       if (purchase.status == PurchaseStatus.pending) {
-        if (mounted) setState(() => _isProcessing = true);
+        if (mounted) {
+          setState(() {
+            _isProcessing = true;
+            _appleFlowStatus = 'StoreKit reports a pending transaction for ${purchase.productID}.';
+          });
+        }
         continue;
       }
 
@@ -152,6 +161,9 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
           setState(() {
             _processingPlanId = null;
             _isProcessing = false;
+            _appleFlowStatus = purchase.status == PurchaseStatus.canceled
+                ? 'StoreKit canceled ${purchase.productID}.'
+                : 'StoreKit error for ${purchase.productID}: ${purchase.error?.message ?? 'no error detail'}';
           });
           if (wasRequested && purchase.status == PurchaseStatus.error) {
             _showMessage(purchase.error?.message ?? 'The App Store purchase could not be completed.');
@@ -163,10 +175,21 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
       if (purchase.status == PurchaseStatus.purchased ||
           purchase.status == PurchaseStatus.restored) {
         final wasRequested = _requestedProductIds.remove(purchase.productID);
-        final isRestore = _isRestoringPurchases;
-        if (purchase.status == PurchaseStatus.restored && !_isRestoringPurchases) {
+        final isRestore =
+            purchase.status == PurchaseStatus.restored || _isRestoringPurchases;
+        // StoreKit can return an existing subscription as `restored` when the
+        // user taps Subscribe for a product already associated with this Apple
+        // account. Process it when that tap initiated the flow; only ignore
+        // restored transactions that arrive unsolicited on screen startup.
+        if (purchase.status == PurchaseStatus.restored &&
+            !_isRestoringPurchases &&
+            !wasRequested) {
           if (purchase.pendingCompletePurchase) {
             await _store.completePurchase(purchase);
+          }
+          if (mounted) {
+            setState(() => _appleFlowStatus =
+                'StoreKit returned an existing transaction for ${purchase.productID}; it was not requested from this screen.');
           }
           continue;
         }
@@ -182,12 +205,23 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
           continue;
         }
 
+        if (mounted) {
+          setState(() => _appleFlowStatus =
+              'StoreKit returned ${purchase.status.name} for ${purchase.productID}; verifying with staging.');
+        }
         try {
           await _appleSubscriptions.verifyAndActivate(
             purchase.verificationData.serverVerificationData,
           );
         } catch (error) {
           debugPrint('Backend Apple subscription verification failed: $error');
+          if (mounted) {
+            setState(() {
+              _appleFlowStatus = 'Apple transaction reached the app, but server verification failed: $error';
+              _processingPlanId = null;
+              _isProcessing = false;
+            });
+          }
           if (mounted && (wasRequested || isRestore)) {
             _showMessage(
               'Apple completed the purchase, but the app could not verify it yet. '
@@ -212,6 +246,7 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
               );
             }
           }
+          if (mounted) setState(() => _appleFlowStatus = 'Apple purchase verified and applied.');
         } catch (e) {
           debugPrint('Error completing purchase: $e');
         } finally {
@@ -242,6 +277,10 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
     final productId = productIds.isEmpty ? null : productIds.first;
     final product = productId == null ? null : _storeProducts[productId];
     if (!_storeAvailable || productId == null || product == null) {
+      if (mounted) {
+        setState(() => _appleFlowStatus =
+            'Cannot call StoreKit: product $productId is unavailable. ${_storeError ?? ''}');
+      }
       _showMessage(_storeError ?? 'This subscription is not available in the App Store yet.');
       return;
     }
@@ -249,6 +288,7 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
     setState(() {
       _processingPlanId = plan.id;
       _isProcessing = true;
+      _appleFlowStatus = 'Calling StoreKit for $productId…';
     });
     _purchaseTimeout?.cancel();
     _purchaseTimeout = Timer(const Duration(seconds: 30), () {
@@ -263,6 +303,11 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
       final started = await _store.buyNonConsumable(
         purchaseParam: PurchaseParam(productDetails: product),
       );
+      if (mounted) {
+        setState(() => _appleFlowStatus = started
+            ? 'StoreKit accepted $productId; waiting for Apple transaction status.'
+            : 'StoreKit returned false for $productId.');
+      }
       if (!started) {
         _purchaseTimeout?.cancel();
         _requestedProductIds.remove(productId);
@@ -270,6 +315,7 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
           setState(() {
             _processingPlanId = null;
             _isProcessing = false;
+            _appleFlowStatus = 'StoreKit did not start $productId.';
           });
           _showMessage('Could not start the App Store purchase. Please try again.');
         }
@@ -281,6 +327,7 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
         setState(() {
           _processingPlanId = null;
           _isProcessing = false;
+          _appleFlowStatus = 'StoreKit call failed for $productId: $error';
         });
         _showMessage('Could not start the App Store purchase: ${error.toString().replaceFirst('Bad state: ', '')}');
       }
@@ -404,6 +451,22 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   _buildCurrentPlanInfo(),
+                  if (_usesAppleIap && _appleFlowStatus != null) ...[
+                    const SizedBox(height: 12),
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF22212A),
+                        borderRadius: BorderRadius.circular(10),
+                        border: Border.all(color: const Color(0xFF6D6178)),
+                      ),
+                      child: Text(
+                        'Apple purchase status: $_appleFlowStatus',
+                        style: const TextStyle(color: Color(0xFFF0EAF4), fontSize: 13),
+                      ),
+                    ),
+                  ],
                   const SizedBox(height: 32),
                   const Text(
                     'Choose Your Plan',

@@ -37,10 +37,13 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
   StreamSubscription<List<PurchaseDetails>>? _purchaseUpdates;
   final Map<String, Map<String, dynamic>> _appleCatalog = {};
   final Map<String, ProductDetails> _appleProducts = {};
+  late Stream<QuerySnapshot<Map<String, dynamic>>> _tiersStream;
+  late Stream<QuerySnapshot<Map<String, dynamic>>> _mySponsorshipsStream;
   int _durationMonths = 1;
   String? _busyKey;
   bool _applePurchasePending = false;
   String? _applePurchaseError;
+  String? _appleFlowStatus;
 
   bool get _isIos => !kIsWeb && defaultTargetPlatform == TargetPlatform.iOS;
 
@@ -70,6 +73,7 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
   @override
   void initState() {
     super.initState();
+    _refreshScreenStreams();
     if (_isIos) {
       _purchaseUpdates = _store.purchaseStream.listen(
         _handleApplePurchases,
@@ -81,6 +85,26 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
         },
       );
       _loadAppleSponsorshipProducts();
+    }
+  }
+
+  void _refreshScreenStreams() {
+    _tiersStream = _service.watchTiers(
+      ownerType: widget.ownerType,
+      ownerId: widget.ownerId,
+    );
+    _mySponsorshipsStream = _service.watchMySponsorships(
+      ownerType: widget.ownerType,
+      ownerId: widget.ownerId,
+    );
+  }
+
+  @override
+  void didUpdateWidget(covariant SponsorshipScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.ownerType != widget.ownerType ||
+        oldWidget.ownerId != widget.ownerId) {
+      _refreshScreenStreams();
     }
   }
 
@@ -120,6 +144,9 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
         _applePurchaseError = response.notFoundIDs.isNotEmpty
             ? 'Some Apple sponsorship products are not ready in App Store Connect.'
             : response.error?.message;
+        _appleFlowStatus = response.productDetails.isEmpty
+            ? 'Apple catalog returned no purchasable products. Missing: ${response.notFoundIDs.join(', ')}'
+            : 'Apple catalog ready: ${response.productDetails.length} product(s).';
         final availableDurations = catalog.values
             .map((item) => (item['durationMonths'] as num?)?.toInt())
             .whereType<int>()
@@ -141,7 +168,12 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
     for (final purchase in purchases) {
       if (!_appleCatalog.containsKey(purchase.productID)) continue;
       if (purchase.status == PurchaseStatus.pending) {
-        if (mounted) setState(() => _applePurchasePending = true);
+        if (mounted) {
+          setState(() {
+            _applePurchasePending = true;
+            _appleFlowStatus = 'StoreKit reports a pending transaction for ${purchase.productID}.';
+          });
+        }
         continue;
       }
       if (purchase.status == PurchaseStatus.canceled ||
@@ -151,7 +183,12 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
           await _store.completePurchase(purchase);
         }
         if (mounted) {
-          setState(() => _applePurchasePending = false);
+          setState(() {
+            _applePurchasePending = false;
+            _appleFlowStatus = purchase.status == PurchaseStatus.canceled
+                ? 'StoreKit canceled ${purchase.productID}.'
+                : 'StoreKit error for ${purchase.productID}: ${purchase.error?.message ?? 'no error detail'}';
+          });
           if (purchase.status == PurchaseStatus.error) {
             _message(purchase.error?.message ??
                 'The App Store could not complete this purchase.');
@@ -162,15 +199,22 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
       if (purchase.status != PurchaseStatus.purchased &&
           purchase.status != PurchaseStatus.restored) continue;
       var verified = false;
+      if (mounted) {
+        setState(() => _appleFlowStatus =
+            'StoreKit returned ${purchase.status.name} for ${purchase.productID}; verifying with staging.');
+      }
       try {
         await _service.verifyAppleSponsorship(
             purchase.verificationData.serverVerificationData);
         verified = true;
         if (mounted && purchase.status == PurchaseStatus.purchased) {
+          setState(() => _appleFlowStatus = 'Apple purchase verified and applied.');
           _message('Sponsorship payment confirmed.');
         }
       } catch (error) {
         if (mounted) {
+          setState(() => _appleFlowStatus =
+              'Apple transaction reached the app, but server verification failed: ${error.toString()}');
           _message(
             'Apple completed the purchase, but Mlivecast could not verify it yet. '
             'Keep this screen open or tap Restore purchase to retry. '
@@ -244,19 +288,32 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
       throw Exception(_applePurchaseError ??
           'This tier does not use an available App Store sponsor plan.');
     }
+    if (mounted) {
+      setState(() => _appleFlowStatus = 'Reserving the sponsorship before opening Apple checkout…');
+    }
     await _service.startAppleSponsorship(
       tierId: tierId,
       productId: matched.key,
       durationMonths: _durationMonths,
     );
     if (mounted) setState(() => _applePurchasePending = true);
+    if (mounted) {
+      setState(() => _appleFlowStatus =
+          'Reservation created. Calling StoreKit for ${matched.key}…');
+    }
     bool started = false;
     try {
       started = await _store.buyNonConsumable(
         purchaseParam: PurchaseParam(productDetails: matched.value),
       );
+      if (mounted) {
+        setState(() => _appleFlowStatus = started
+            ? 'StoreKit accepted ${matched.key}; waiting for Apple transaction status.'
+            : 'StoreKit returned false for ${matched.key}.');
+      }
     } catch (e) {
       debugPrint('StoreKit buyNonConsumable failed: $e');
+      if (mounted) setState(() => _appleFlowStatus = 'StoreKit call failed: $e');
       started = false;
     }
     if (!started) {
@@ -306,6 +363,10 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
     try {
       await action();
     } catch (error) {
+      if (_requiresAppleIap && key.startsWith('buy_') && mounted) {
+        setState(() => _appleFlowStatus =
+            'Purchase stopped before StoreKit completed: ${error.toString().replaceFirst('Exception: ', '')}');
+      }
       _message(error.toString().replaceFirst('Exception: ', ''));
     } finally {
       if (mounted) setState(() => _busyKey = null);
@@ -381,6 +442,10 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
           padding: const EdgeInsets.fromLTRB(16, 12, 16, 40),
           children: [
             _buildIntro(),
+            if (_requiresAppleIap && _appleFlowStatus != null) ...[
+              const SizedBox(height: 10),
+              _AppleFlowDiagnostic(_appleFlowStatus!),
+            ],
             const SizedBox(height: 18),
             if (widget.isOwner) _buildPayoutSetup(),
             if (widget.isOwner) _buildOwnerTiers() else _buildAvailableTiers(),
@@ -489,7 +554,7 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
 
   Widget _buildAvailableTiers() {
     return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-      stream: _service.watchTiers(ownerType: widget.ownerType, ownerId: widget.ownerId),
+      stream: _tiersStream,
       builder: (context, snapshot) {
         final docs = snapshot.data?.docs.where((doc) {
           if (doc.data()['active'] != true) return false;
@@ -516,7 +581,7 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
 
   Widget _buildOwnerTiers() {
     return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-      stream: _service.watchTiers(ownerType: widget.ownerType, ownerId: widget.ownerId),
+      stream: _tiersStream,
       builder: (context, snapshot) {
         final docs = snapshot.data?.docs ?? [];
         return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -830,7 +895,7 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
 
   Widget _buildMySponsorships() {
     return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-      stream: _service.watchMySponsorships(ownerType: widget.ownerType, ownerId: widget.ownerId),
+      stream: _mySponsorshipsStream,
       builder: (context, snapshot) {
         final docs = snapshot.data?.docs ?? [];
         if (docs.isEmpty) return const SizedBox.shrink();
@@ -927,16 +992,45 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
   }
 }
 
-class SponsorshipBannerStrip extends StatelessWidget {
+class SponsorshipBannerStrip extends StatefulWidget {
   final String ownerType;
   final String ownerId;
 
   const SponsorshipBannerStrip({super.key, required this.ownerType, required this.ownerId});
 
   @override
+  State<SponsorshipBannerStrip> createState() => _SponsorshipBannerStripState();
+}
+
+class _SponsorshipBannerStripState extends State<SponsorshipBannerStrip> {
+  late Stream<QuerySnapshot<Map<String, dynamic>>> _sponsorsStream;
+
+  @override
+  void initState() {
+    super.initState();
+    _refreshStream();
+  }
+
+  void _refreshStream() {
+    _sponsorsStream = SponsorshipService.instance.watchSponsors(
+      ownerType: widget.ownerType,
+      ownerId: widget.ownerId,
+    );
+  }
+
+  @override
+  void didUpdateWidget(covariant SponsorshipBannerStrip oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.ownerType != widget.ownerType ||
+        oldWidget.ownerId != widget.ownerId) {
+      _refreshStream();
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
     return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-      stream: SponsorshipService.instance.watchSponsors(ownerType: ownerType, ownerId: ownerId),
+      stream: _sponsorsStream,
       builder: (context, snapshot) {
         final docs = snapshot.data?.docs ?? [];
         if (docs.isEmpty) return const SizedBox.shrink();
@@ -1017,6 +1111,26 @@ class _EmptyMessage extends StatelessWidget {
   Widget build(BuildContext context) => Padding(
         padding: const EdgeInsets.symmetric(vertical: 16),
         child: Text(text, style: const TextStyle(color: Color(0xFFC4C4CD))),
+      );
+}
+
+class _AppleFlowDiagnostic extends StatelessWidget {
+  final String text;
+  const _AppleFlowDiagnostic(this.text);
+
+  @override
+  Widget build(BuildContext context) => Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: const Color(0xFF22212A),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: const Color(0xFF6D6178)),
+        ),
+        child: Text(
+          'Apple purchase status: $text',
+          style: const TextStyle(color: Color(0xFFF0EAF4), fontSize: 13),
+        ),
       );
 }
 

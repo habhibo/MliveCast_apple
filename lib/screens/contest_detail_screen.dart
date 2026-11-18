@@ -33,6 +33,7 @@ class _ContestDetailScreenState extends State<ContestDetailScreen>
     with SingleTickerProviderStateMixin {
   late TabController _tabController;
   Timer? _timer;
+  final ValueNotifier<int> _countdownTick = ValueNotifier<int>(0);
 
   String _entriesSearchQuery = '';
   final TextEditingController _entriesSearchController = TextEditingController();
@@ -62,15 +63,14 @@ class _ContestDetailScreenState extends State<ContestDetailScreen>
     _tabController.dispose();
     _entriesSearchController.dispose();
     _timer?.cancel();
+    _countdownTick.dispose();
     super.dispose();
   }
 
   void _startTimer() {
     _timer?.cancel();
     _timer = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (mounted) {
-        setState(() {});
-      }
+      if (mounted) _countdownTick.value++;
     });
   }
 
@@ -769,8 +769,18 @@ class _ContestDetailScreenState extends State<ContestDetailScreen>
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               const Text('ENDS IN', style: TextStyle(color: Colors.white54, fontSize: 10, letterSpacing: 1)),
-              Text(widget.contest.calculatedEndsIn,
-                  style: const TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.bold, letterSpacing: 1)),
+              ValueListenableBuilder<int>(
+                valueListenable: _countdownTick,
+                builder: (context, _, __) => Text(
+                  widget.contest.calculatedEndsIn,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 20,
+                    fontWeight: FontWeight.bold,
+                    letterSpacing: 1,
+                  ),
+                ),
+              ),
             ],
           ),
           const Spacer(),
