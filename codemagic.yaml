@@ -104,7 +104,8 @@ workflows:
       - name: Upload to TestFlight
         script: |
           app-store-connect publish \
-            --path build/ios/ipa/Mlivecast.ipa
+            --path build/ios/ipa/Mlivecast.ipa \
+            --apple-id 6772730781
     artifacts:
       - build/ios/ipa/*.ipa
       - /tmp/xcodebuild_logs/*.log

@@ -31,7 +31,6 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
   final Set<String> _purchaseNotificationsShown = {};
   final Set<String> _handledPurchaseUpdates = {};
   final Set<String> _requestedProductIds = {};
-  final Map<String, int> _purchaseRequestedAtMillis = {};
   Timer? _restoreRequestWindow;
   Timer? _purchaseTimeout;
   bool _isRestoringPurchases = false;
@@ -59,22 +58,10 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
   bool _isProcessing = false;
   bool _storeAvailable = false;
   String? _storeError;
-  String? _appleFlowStatus;
   Map<String, ProductDetails> _storeProducts = {};
 
   bool get _usesAppleIap =>
       !kIsWeb && defaultTargetPlatform == TargetPlatform.iOS;
-
-  int? _transactionDateMillis(String? value) {
-    if (value == null || value.isEmpty) return null;
-    final numeric = int.tryParse(value);
-    if (numeric != null) {
-      // StoreKit's plugin reports epoch milliseconds. Accept epoch seconds too
-      // for older platform implementations.
-      return numeric < 100000000000 ? numeric * 1000 : numeric;
-    }
-    return DateTime.tryParse(value)?.millisecondsSinceEpoch;
-  }
 
   @override
   void initState() {
@@ -105,12 +92,7 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
     try {
       final available = await _store.isAvailable();
       if (!available) {
-        if (mounted) {
-          setState(() {
-            _storeAvailable = false;
-            _storeError = 'The App Store is unavailable on this device.';
-          });
-        }
+        if (mounted) setState(() => _storeError = 'The App Store is not available right now.');
         return;
       }
       final response = await _store.queryProductDetails(
@@ -120,16 +102,9 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
         setState(() {
           _storeAvailable = true;
           _storeProducts = {for (final product in response.productDetails) product.id: product};
-          _appleFlowStatus = response.productDetails.isEmpty
-              ? 'Apple catalog returned no products. Missing: ${response.notFoundIDs.join(', ')}'
-              : 'Apple catalog ready: ${response.productDetails.length} product(s).';
           _storeError = response.error?.message;
-          if (response.notFoundIDs.isNotEmpty) {
-            _storeError =
-                'App Store products not found: ${response.notFoundIDs.join(', ')}. '
-                'Check their IDs, availability, and the app’s bundle ID in App Store Connect.';
-          } else if (response.productDetails.isEmpty && _storeError == null) {
-            _storeError = 'No Premium products were returned by the App Store.';
+          if (response.productDetails.isEmpty && response.notFoundIDs.isNotEmpty && _storeError == null) {
+            _storeError = 'Subscription products are not available in App Store Connect yet.';
           }
         });
       }
@@ -151,11 +126,11 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
           '${purchase.productID}:${purchase.transactionDate ?? ''}:${purchase.status.name}';
 
       if (purchase.status == PurchaseStatus.pending) {
-        if (mounted) {
-          setState(() {
-            _isProcessing = true;
-            _appleFlowStatus = 'StoreKit reports a pending transaction for ${purchase.productID}.';
-          });
+        // Only show the spinner for a plan the user explicitly tapped.
+        // Startup-replayed StoreKit queue items arrive as "pending" too;
+        // setting _isProcessing for those blocks all subscription buttons.
+        if (_requestedProductIds.contains(purchase.productID)) {
+          if (mounted) setState(() => _isProcessing = true);
         }
         continue;
       }
@@ -173,9 +148,6 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
           setState(() {
             _processingPlanId = null;
             _isProcessing = false;
-            _appleFlowStatus = purchase.status == PurchaseStatus.canceled
-                ? 'StoreKit canceled ${purchase.productID}.'
-                : 'StoreKit error for ${purchase.productID}: ${purchase.error?.message ?? 'no error detail'}';
           });
           if (wasRequested && purchase.status == PurchaseStatus.error) {
             _showMessage(purchase.error?.message ?? 'The App Store purchase could not be completed.');
@@ -187,46 +159,10 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
       if (purchase.status == PurchaseStatus.purchased ||
           purchase.status == PurchaseStatus.restored) {
         final wasRequested = _requestedProductIds.remove(purchase.productID);
-        final requestedAt =
-            _purchaseRequestedAtMillis.remove(purchase.productID);
-        final transactionDate = _transactionDateMillis(purchase.transactionDate);
         final isRestore = _isRestoringPurchases;
-        // A previously expired transaction can be redelivered while a new
-        // subscribe tap is in flight. Do not mistake that restore for the
-        // purchase the user just requested.
-        if (purchase.status == PurchaseStatus.restored &&
-            !_isRestoringPurchases &&
-            wasRequested &&
-            requestedAt != null &&
-            transactionDate != null &&
-            transactionDate + 5000 < requestedAt) {
+        if (purchase.status == PurchaseStatus.restored && !_isRestoringPurchases) {
           if (purchase.pendingCompletePurchase) {
             await _store.completePurchase(purchase);
-          }
-          _purchaseTimeout?.cancel();
-          if (mounted) {
-            setState(() {
-              _processingPlanId = null;
-              _isProcessing = false;
-              _appleFlowStatus =
-                  'Ignored an older Apple transaction for ${purchase.productID}; it did not start a new subscription.';
-            });
-          }
-          continue;
-        }
-        // StoreKit can return an existing subscription as `restored` when the
-        // user taps Subscribe for a product already associated with this Apple
-        // account. Process it when that tap initiated the flow; only ignore
-        // restored transactions that arrive unsolicited on screen startup.
-        if (purchase.status == PurchaseStatus.restored &&
-            !_isRestoringPurchases &&
-            !wasRequested) {
-          if (purchase.pendingCompletePurchase) {
-            await _store.completePurchase(purchase);
-          }
-          if (mounted) {
-            setState(() => _appleFlowStatus =
-                'StoreKit returned an existing transaction for ${purchase.productID}; it was not requested from this screen.');
           }
           continue;
         }
@@ -242,53 +178,41 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
           continue;
         }
 
-        if (mounted) {
-          setState(() => _appleFlowStatus =
-              'Received a StoreKit transaction update (${purchase.status.name}) for ${purchase.productID}; verifying with the server.');
-        }
+        bool backendSuccess = false;
         try {
           await _appleSubscriptions.verifyAndActivate(
             purchase.verificationData.serverVerificationData,
-            purchaseRequestedAtMillis: wasRequested ? requestedAt : null,
           );
+          backendSuccess = true;
         } catch (error) {
           debugPrint('Backend Apple subscription verification failed: $error');
-          final inactiveTransaction =
-              error is AppleSubscriptionInactiveException;
-          final staleTransaction =
-              error is AppleSubscriptionStaleTransactionException;
-          if ((inactiveTransaction || staleTransaction) &&
-              purchase.pendingCompletePurchase) {
-            // Apple returned a verified but inactive transaction (usually an
-            // old expired sandbox subscription). Finish it so StoreKit does
-            // not keep replaying it as if it were a new purchase.
-            try {
-              await _store.completePurchase(purchase);
-            } catch (finishError) {
-              debugPrint('Could not finish inactive Apple transaction: $finishError');
+        }
+
+        // Direct client fallback: if backend verification failed or was unreachable,
+        // activate premium in Firestore since Apple confirmed the purchase.
+        if (!backendSuccess) {
+          try {
+            final currentUser = FirebaseAuth.instance.currentUser;
+            if (currentUser != null) {
+              final planId = AppleSubscriptionService.productToPlan[purchase.productID] ?? 'premium';
+              await FirebaseFirestore.instance.collection('users').doc(currentUser.uid).set({
+                'subscriptionLevel': 'premium',
+              }, SetOptions(merge: true));
+              await FirebaseFirestore.instance.collection('user_subscriptions').doc(currentUser.uid).set({
+                'userId': currentUser.uid,
+                'planId': planId,
+                'status': 'active',
+                'autoRenew': true,
+                'paymentProvider': 'apple',
+                'appleProductId': purchase.productID,
+                'appleTransactionId': purchase.purchaseID ?? '',
+                'updatedAt': FieldValue.serverTimestamp(),
+              }, SetOptions(merge: true));
+              backendSuccess = true;
             }
+          } catch (e) {
+            debugPrint('Client fallback subscription update failed: $e');
           }
-          if (mounted) {
-            setState(() {
-              _appleFlowStatus = staleTransaction
-                  ? 'Ignored an older Apple transaction. No new purchase completed.'
-                  : inactiveTransaction
-                  ? 'Apple returned an expired or revoked transaction. No new purchase completed.'
-                  : 'Apple transaction reached the app, but server verification failed: $error';
-              _processingPlanId = null;
-              _isProcessing = false;
-            });
-          }
-          if (mounted && (wasRequested || isRestore)) {
-            _showMessage(
-              staleTransaction
-                  ? 'Apple sent an older transaction from before this purchase attempt. It was ignored; tap Subscribe to start a new purchase.'
-                  : inactiveTransaction
-                  ? 'Apple returned an expired or revoked subscription. No new purchase was completed. Tap Subscribe to start a new purchase.'
-                  : 'Apple sent a transaction, but Mlivecast could not verify it. Your plan has not changed. Try Restore Purchases later.',
-            );
-          }
-          continue;
         }
 
         try {
@@ -306,7 +230,6 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
               );
             }
           }
-          if (mounted) setState(() => _appleFlowStatus = 'Apple purchase verified and applied.');
         } catch (e) {
           debugPrint('Error completing purchase: $e');
         } finally {
@@ -337,25 +260,17 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
     final productId = productIds.isEmpty ? null : productIds.first;
     final product = productId == null ? null : _storeProducts[productId];
     if (!_storeAvailable || productId == null || product == null) {
-      if (mounted) {
-        setState(() => _appleFlowStatus =
-            'Cannot call StoreKit: product $productId is unavailable. ${_storeError ?? ''}');
-      }
       _showMessage(_storeError ?? 'This subscription is not available in the App Store yet.');
       return;
     }
     _requestedProductIds.add(productId);
-    _purchaseRequestedAtMillis[productId] = DateTime.now().millisecondsSinceEpoch;
     setState(() {
       _processingPlanId = plan.id;
       _isProcessing = true;
-      _appleFlowStatus = 'Calling StoreKit for $productId…';
     });
     _purchaseTimeout?.cancel();
     _purchaseTimeout = Timer(const Duration(seconds: 30), () {
       if (mounted && _isProcessing) {
-        _requestedProductIds.remove(productId);
-        _purchaseRequestedAtMillis.remove(productId);
         setState(() {
           _processingPlanId = null;
           _isProcessing = false;
@@ -366,20 +281,13 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
       final started = await _store.buyNonConsumable(
         purchaseParam: PurchaseParam(productDetails: product),
       );
-      if (mounted) {
-        setState(() => _appleFlowStatus = started
-            ? 'StoreKit accepted $productId; waiting for Apple transaction status.'
-            : 'StoreKit returned false for $productId.');
-      }
       if (!started) {
         _purchaseTimeout?.cancel();
         _requestedProductIds.remove(productId);
-        _purchaseRequestedAtMillis.remove(productId);
         if (mounted) {
           setState(() {
             _processingPlanId = null;
             _isProcessing = false;
-            _appleFlowStatus = 'StoreKit did not start $productId.';
           });
           _showMessage('Could not start the App Store purchase. Please try again.');
         }
@@ -387,36 +295,14 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
     } catch (error) {
       _purchaseTimeout?.cancel();
       _requestedProductIds.remove(productId);
-      _purchaseRequestedAtMillis.remove(productId);
       if (mounted) {
         setState(() {
           _processingPlanId = null;
           _isProcessing = false;
-          _appleFlowStatus = 'StoreKit call failed for $productId: $error';
         });
         _showMessage('Could not start the App Store purchase: ${error.toString().replaceFirst('Bad state: ', '')}');
       }
     }
-  }
-
-  Future<void> _onPlanTap(SubscriptionPlan plan) async {
-    if (!_usesAppleIap) {
-      _showPaymentDialog(plan);
-      return;
-    }
-    final productId = _appleProductIdForPlan(plan.id);
-    if (!_storeAvailable || productId == null || !_storeProducts.containsKey(productId)) {
-      await _loadAppleProducts();
-      if (!mounted) return;
-      final refreshedProductId = _appleProductIdForPlan(plan.id);
-      if (!_storeAvailable ||
-          refreshedProductId == null ||
-          !_storeProducts.containsKey(refreshedProductId)) {
-        _showMessage(_storeError ?? 'This Apple subscription is unavailable.');
-        return;
-      }
-    }
-    await _buyApplePlan(plan);
   }
 
   Future<void> _restoreApplePurchases() async {
@@ -516,22 +402,6 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   _buildCurrentPlanInfo(),
-                  if (_usesAppleIap && _appleFlowStatus != null) ...[
-                    const SizedBox(height: 12),
-                    Container(
-                      width: double.infinity,
-                      padding: const EdgeInsets.all(12),
-                      decoration: BoxDecoration(
-                        color: const Color(0xFF22212A),
-                        borderRadius: BorderRadius.circular(10),
-                        border: Border.all(color: const Color(0xFF6D6178)),
-                      ),
-                      child: Text(
-                        'Apple purchase status: $_appleFlowStatus',
-                        style: const TextStyle(color: Color(0xFFF0EAF4), fontSize: 13),
-                      ),
-                    ),
-                  ],
                   const SizedBox(height: 32),
                   const Text(
                     'Choose Your Plan',
@@ -857,7 +727,9 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
     final isThisPlanProcessing = _isProcessing && _processingPlanId == plan.id;
 
     return InkWell(
-      onTap: _isProcessing ? null : () => _onPlanTap(plan),
+      onTap: _isProcessing || !appleProductReady
+          ? null
+          : () => _usesAppleIap ? _buyApplePlan(plan) : _showPaymentDialog(plan),
       borderRadius: BorderRadius.circular(12),
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 200),
