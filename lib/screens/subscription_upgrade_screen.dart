@@ -252,6 +252,43 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
     }
   }
 
+  /// Drain any unfinished StoreKit transactions before attempting a purchase.
+  /// Apple's StoreKit will refuse to show the payment sheet if a pending or
+  /// completed-but-not-finished transaction for the same product already exists
+  /// in the queue. Calling restorePurchases() flushes all those via the stream,
+  /// which completes them. We wait up to 5 seconds for the stream to go quiet.
+  Future<void> _drainStoreKitQueue() async {
+    _isDrainingQueue = true;
+    final completer = Completer<void>();
+    Timer? quietTimer;
+    // Listen until 2 s of silence means the queue is drained.
+    void resetQuiet() {
+      quietTimer?.cancel();
+      quietTimer = Timer(const Duration(seconds: 2), () {
+        if (!completer.isCompleted) completer.complete();
+      });
+    }
+    // A fresh one-time subscription that just completes everything it sees.
+    StreamSubscription<List<PurchaseDetails>>? drainSub;
+    drainSub = _store.purchaseStream.listen((purchases) async {
+      for (final p in purchases) {
+        if (p.pendingCompletePurchase) {
+          try {
+            await _store.completePurchase(p);
+          } catch (_) {}
+        }
+      }
+      resetQuiet();
+    });
+    resetQuiet();
+    // Guard with a 5 s hard timeout.
+    try {
+      await completer.future.timeout(const Duration(seconds: 5));
+    } catch (_) {}
+    await drainSub.cancel();
+    _isDrainingQueue = false;
+  }
+
   Future<void> _buyApplePlan(SubscriptionPlan plan) async {
     final productIds = AppleSubscriptionService.productToPlan.entries
         .where((entry) => entry.value == plan.id)
@@ -269,6 +306,9 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
       _isProcessing = true;
     });
     _purchaseTimeout?.cancel();
+    // Drain any stale StoreKit transactions first so the payment sheet can appear.
+    await _drainStoreKitQueue();
+    if (!mounted) return;
     _purchaseTimeout = Timer(const Duration(seconds: 30), () {
       if (mounted && _isProcessing) {
         setState(() {

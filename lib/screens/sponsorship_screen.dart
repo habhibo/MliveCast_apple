@@ -269,13 +269,23 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
     );
     _requestedSponsorProductIds.add(matched.key);
     if (mounted) setState(() => _applePurchasePending = true);
+    // Drain any stale StoreKit transactions so the payment sheet can appear.
+    await _drainSponsorshipQueue();
+    if (!mounted) {
+      _requestedSponsorProductIds.remove(matched.key);
+      await _service.cancelPendingAppleSponsorship(matched.key).catchError((_) {});
+      return;
+    }
     bool started = false;
     try {
-      started = await _store.buyNonConsumable(
+      // Sponsorship products are CONSUMABLE in App Store Connect.
+      // Using buyConsumable means Apple always shows the payment sheet —
+      // it never silently restores a previous transaction.
+      started = await _store.buyConsumable(
         purchaseParam: PurchaseParam(productDetails: matched.value),
       );
     } catch (e) {
-      debugPrint('StoreKit buyNonConsumable failed: $e');
+      debugPrint('StoreKit buyConsumable failed: $e');
       started = false;
     }
     if (!started) {
@@ -286,6 +296,38 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
       if (mounted) setState(() => _applePurchasePending = false);
       throw Exception('The App Store purchase did not start. Try again.');
     }
+  }
+
+  /// Drain any unfinished StoreKit transactions before initiating a purchase.
+  /// Apple silently returns false from buyConsumable / buyNonConsumable when
+  /// there is an unfinished transaction for the same product still in the queue.
+  Future<void> _drainSponsorshipQueue() async {
+    final completer = Completer<void>();
+    Timer? quietTimer;
+    void resetQuiet() {
+      quietTimer?.cancel();
+      quietTimer = Timer(const Duration(seconds: 2), () {
+        if (!completer.isCompleted) completer.complete();
+      });
+    }
+    StreamSubscription<List<PurchaseDetails>>? drainSub;
+    drainSub = _store.purchaseStream.listen((purchases) async {
+      for (final p in purchases) {
+        // Only auto-complete purchases the user has NOT just requested.
+        if (!_requestedSponsorProductIds.contains(p.productID) &&
+            p.pendingCompletePurchase) {
+          try {
+            await _store.completePurchase(p);
+          } catch (_) {}
+        }
+      }
+      resetQuiet();
+    });
+    resetQuiet();
+    try {
+      await completer.future.timeout(const Duration(seconds: 5));
+    } catch (_) {}
+    await drainSub.cancel();
   }
 
   Future<void> _cancelPendingReservation(String docId, String? appleProductId) async {
@@ -315,13 +357,21 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
     );
     if (mounted) setState(() => _applePurchasePending = true);
     _requestedSponsorProductIds.add(appleProductId);
+    // Drain stale StoreKit queue before attempting the purchase.
+    await _drainSponsorshipQueue();
+    if (!mounted) {
+      _requestedSponsorProductIds.remove(appleProductId);
+      await _service.cancelPendingAppleSponsorship(appleProductId).catchError((_) {});
+      return;
+    }
     bool started = false;
     try {
-      started = await _store.buyNonConsumable(
+      // Sponsorship products are CONSUMABLE in App Store Connect.
+      started = await _store.buyConsumable(
         purchaseParam: PurchaseParam(productDetails: product),
       );
     } catch (e) {
-      debugPrint('StoreKit buyNonConsumable (resume) failed: $e');
+      debugPrint('StoreKit buyConsumable (resume) failed: $e');
       started = false;
     }
     if (!started) {
