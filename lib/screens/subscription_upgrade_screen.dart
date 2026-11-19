@@ -54,6 +54,9 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
 
   List<SubscriptionPlan> _plans = [];
   UserSubscription? _currentSubscription;
+  // Canonical subscription level from the users doc — used as fallback when
+  // user_subscriptions record is missing, stale, or has an expired endDate.
+  String? _canonicalLevel;
   bool _isLoading = true;
   bool _isProcessing = false;
   bool _storeAvailable = false;
@@ -252,43 +255,6 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
     }
   }
 
-  /// Drain any unfinished StoreKit transactions before attempting a purchase.
-  /// Apple's StoreKit will refuse to show the payment sheet if a pending or
-  /// completed-but-not-finished transaction for the same product already exists
-  /// in the queue. Calling restorePurchases() flushes all those via the stream,
-  /// which completes them. We wait up to 5 seconds for the stream to go quiet.
-  Future<void> _drainStoreKitQueue() async {
-    _isDrainingQueue = true;
-    final completer = Completer<void>();
-    Timer? quietTimer;
-    // Listen until 2 s of silence means the queue is drained.
-    void resetQuiet() {
-      quietTimer?.cancel();
-      quietTimer = Timer(const Duration(seconds: 2), () {
-        if (!completer.isCompleted) completer.complete();
-      });
-    }
-    // A fresh one-time subscription that just completes everything it sees.
-    StreamSubscription<List<PurchaseDetails>>? drainSub;
-    drainSub = _store.purchaseStream.listen((purchases) async {
-      for (final p in purchases) {
-        if (p.pendingCompletePurchase) {
-          try {
-            await _store.completePurchase(p);
-          } catch (_) {}
-        }
-      }
-      resetQuiet();
-    });
-    resetQuiet();
-    // Guard with a 5 s hard timeout.
-    try {
-      await completer.future.timeout(const Duration(seconds: 5));
-    } catch (_) {}
-    await drainSub.cancel();
-    _isDrainingQueue = false;
-  }
-
   Future<void> _buyApplePlan(SubscriptionPlan plan) async {
     final productIds = AppleSubscriptionService.productToPlan.entries
         .where((entry) => entry.value == plan.id)
@@ -306,9 +272,6 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
       _isProcessing = true;
     });
     _purchaseTimeout?.cancel();
-    // Drain any stale StoreKit transactions first so the payment sheet can appear.
-    await _drainStoreKitQueue();
-    if (!mounted) return;
     _purchaseTimeout = Timer(const Duration(seconds: 30), () {
       if (mounted && _isProcessing) {
         setState(() {
@@ -406,11 +369,26 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
     if (user != null) {
       final plans = await _subscriptionService.getPlans();
       final subscription = await _subscriptionService.getUserSubscription(user.uid);
+      // Also read the canonical subscriptionLevel from the users collection.
+      // This is the source of truth for feature gating. The user_subscriptions
+      // record may have an expired endDate (e.g. from a previous Sandbox test)
+      // while users.subscriptionLevel still correctly reflects their entitlement.
+      String? canonicalLevel;
+      try {
+        final userDoc = await FirebaseFirestore.instance
+            .collection('users')
+            .doc(user.uid)
+            .get();
+        canonicalLevel = userDoc.data()?['subscriptionLevel'] as String?;
+      } catch (e) {
+        debugPrint('Could not read users.subscriptionLevel: $e');
+      }
       
       if (mounted) {
         setState(() {
           _plans = plans;
           _currentSubscription = subscription;
+          _canonicalLevel = canonicalLevel;
           _isLoading = false;
         });
       }
@@ -534,8 +512,13 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
     final hasActiveSub = _currentSubscription != null &&
         _currentSubscription!.isActive &&
         !_currentSubscription!.isExpired;
+    // If the subscription record is missing/expired but users.subscriptionLevel
+    // says premium, still show the premium banner (the data just needs a refresh).
+    final canonicalIsPremium = _canonicalLevel != null &&
+        _canonicalLevel != 'free' &&
+        _canonicalLevel!.isNotEmpty;
 
-    if (!hasActiveSub) {
+    if (!hasActiveSub && !canonicalIsPremium) {
       return Container(
         padding: const EdgeInsets.all(20),
         decoration: BoxDecoration(
@@ -558,10 +541,15 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
       );
     }
 
-    final currentPlan = _plans.firstWhere(
-      (p) => p.id == _currentSubscription!.planId,
-      orElse: () => _plans.firstWhere((p) => p.id == 'premium', orElse: () => _plans[0]),
-    );
+    final currentPlan = hasActiveSub
+        ? _plans.firstWhere(
+            (p) => p.id == _currentSubscription!.planId,
+            orElse: () => _plans.firstWhere((p) => p.id == 'premium', orElse: () => _plans[0]),
+          )
+        : _plans.firstWhere(
+            (p) => p.id == (_canonicalLevel ?? 'premium'),
+            orElse: () => _plans.firstWhere((p) => p.id == 'premium', orElse: () => _plans[0]),
+          );
 
     return Container(
       padding: const EdgeInsets.all(20),
@@ -588,12 +576,17 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
             ],
           ),
           const SizedBox(height: 8),
-          if (_currentSubscription!.endDate != null)
+          if (hasActiveSub && _currentSubscription!.endDate != null)
             Text(
               '${_currentSubscription!.autoRenew ? 'Renews on' : 'Access ends'}: ${_currentSubscription!.endDate.toString().split('.')[0]}',
               style: TextStyle(color: Colors.white.withOpacity(0.6), fontSize: 12),
+            )
+          else if (!hasActiveSub && canonicalIsPremium)
+            const Text(
+              'Your subscription is active. Tap "Subscribe with Apple" to renew or confirm.',
+              style: TextStyle(color: Colors.white60, fontSize: 12),
             ),
-          if (_currentSubscription!.status == 'canceled')
+          if (hasActiveSub && _currentSubscription!.status == 'canceled')
             Container(
               margin: const EdgeInsets.only(top: 8),
               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
@@ -612,11 +605,22 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
   }
 
   Widget _buildPlanCard(SubscriptionPlan plan) {
+    // hasActiveSub: subscription record exists, is active, and not expired.
     final hasActiveSub = _currentSubscription != null &&
         _currentSubscription!.isActive &&
         !_currentSubscription!.isExpired;
-    final activePlanId = hasActiveSub ? _currentSubscription!.planId : 'free';
-    final isCurrentPlan = activePlanId == plan.id;
+    // canonicalIsPremium: users.subscriptionLevel says premium even if the
+    // user_subscriptions record is missing or its endDate has expired.
+    // This covers the case where profile shows "Premium" but sub page shows "Free".
+    final canonicalIsPremium = _canonicalLevel != null &&
+        _canonicalLevel != 'free' &&
+        _canonicalLevel!.isNotEmpty;
+    final effectiveHasActive = hasActiveSub || canonicalIsPremium;
+    final activePlanId = hasActiveSub
+        ? _currentSubscription!.planId
+        : (canonicalIsPremium ? (_canonicalLevel ?? 'free') : 'free');
+    final isCurrentPlan = activePlanId == plan.id ||
+        (canonicalIsPremium && plan.id == 'premium' && activePlanId.startsWith('premium'));
     final currentPlanPrice = _plans.firstWhere(
       (p) => p.id == activePlanId,
       orElse: () => _plans[0],
@@ -708,7 +712,9 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
             children: plan.features.map((feature) => _buildFeatureChip(feature)).toList(),
           ),
           const SizedBox(height: 24),
-          if (isCurrentPlan || (_usesAppleIap && plan.id == 'free'))
+          if (isCurrentPlan || (_usesAppleIap && plan.id == 'free' && !effectiveHasActive))
+            _buildCurrentPlanButton()
+          else if (isCurrentPlan)
             _buildCurrentPlanButton()
           else
             _buildUpgradeButton(plan, isUpgrade),
