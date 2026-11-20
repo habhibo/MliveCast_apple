@@ -297,6 +297,22 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
       _processingPlanId = plan.id;
       _isProcessing = true;
     });
+    // Step 1: drain any stuck StoreKit transactions.
+    // If there is an unfinished transaction for this product in the queue,
+    // StoreKit queues the new payment but never shows the payment sheet.
+    // restorePurchases() replays all queue entries → our existing listener
+    // calls completePurchase on each one → queue is clean after the wait.
+    _showMessage('Clearing Apple queue…');
+    try {
+      await _store.restorePurchases();
+    } catch (_) {}
+    // Give StoreKit 3 s to deliver and complete all pending events.
+    await Future<void>.delayed(const Duration(seconds: 3));
+    if (!mounted) {
+      _requestedProductIds.remove(productId);
+      return;
+    }
+    // Step 2: attempt the actual purchase on a clean queue.
     _showMessage('Contacting App Store for $productId…');
     _purchaseTimeout?.cancel();
     _purchaseTimeout = Timer(const Duration(seconds: 30), () {

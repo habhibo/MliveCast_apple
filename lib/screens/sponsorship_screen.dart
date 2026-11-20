@@ -166,8 +166,12 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
         }
         if (mounted) {
           setState(() => _applePurchasePending = false);
+          // Only show error messages for products the user explicitly tapped.
+          // Startup restorePurchases() may surface old error events (e.g.
+          // "apple transaction is already in use") for previously-stuck
+          // transactions — those should be silently swallowed.
           if (purchase.status == PurchaseStatus.error &&
-              _requestedSponsorProductIds.isEmpty) {
+              _requestedSponsorProductIds.contains(purchase.productID)) {
             _message(purchase.error?.message ??
                 'The App Store could not complete this purchase.');
           }
@@ -267,13 +271,26 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
       await _service.cancelPendingAppleSponsorship(matched.key);
     } catch (_) {}
 
+    // Drain any stuck StoreKit transactions BEFORE creating the backend record.
+    // Silver/Diamond show "already in use" because a previous purchase attempt
+    // left an unfinished transaction in the queue. restorePurchases() replays
+    // those entries → the existing listener completes them → clean queue.
+    if (mounted) setState(() => _applePurchasePending = true);
+    try {
+      await _store.restorePurchases();
+    } catch (_) {}
+    await Future<void>.delayed(const Duration(seconds: 3));
+    if (!mounted) {
+      setState(() => _applePurchasePending = false);
+      return;
+    }
+
     await _service.startAppleSponsorship(
       tierId: tierId,
       productId: matched.key,
       durationMonths: _durationMonths,
     );
     _requestedSponsorProductIds.add(matched.key);
-    if (mounted) setState(() => _applePurchasePending = true);
     bool started = false;
     try {
       started = await _store.buyNonConsumable(
@@ -313,12 +330,23 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
     try {
       await _service.cancelPendingAppleSponsorship(appleProductId);
     } catch (_) {}
+
+    // Drain stuck StoreKit queue before attempting the purchase.
+    if (mounted) setState(() => _applePurchasePending = true);
+    try {
+      await _store.restorePurchases();
+    } catch (_) {}
+    await Future<void>.delayed(const Duration(seconds: 3));
+    if (!mounted) {
+      setState(() => _applePurchasePending = false);
+      return;
+    }
+
     await _service.startAppleSponsorship(
       tierId: tierId,
       productId: appleProductId,
       durationMonths: _durationMonths,
     );
-    if (mounted) setState(() => _applePurchasePending = true);
     _requestedSponsorProductIds.add(appleProductId);
     bool started = false;
     try {
