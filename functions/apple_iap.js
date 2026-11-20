@@ -2,6 +2,7 @@
 
 const functions = require("firebase-functions/v1");
 const admin = require("firebase-admin");
+const crypto = require("crypto");
 const sponsorship = require("./sponsorship");
 const {
   Environment,
@@ -17,6 +18,16 @@ const ROOT_CERT_SECRET = "APPLE_ROOT_CA_G3_BASE64";
 
 if (!admin.apps.length) admin.initializeApp();
 const db = admin.firestore();
+
+function diagnosticTag(value) {
+  return crypto.createHash("sha256").update(String(value || ""))
+      .digest("hex").slice(0, 10);
+}
+
+function diagnosticSuffix(value) {
+  const text = String(value || "");
+  return text ? text.slice(-6) : "none";
+}
 
 /**
  * Decode a JWS payload for routing only; this does not verify its signature.
@@ -267,18 +278,57 @@ exports.verifyAppleSubscription = functions
       if (req.method !== "POST") {
         return res.status(405).json({error: "POST required"});
       }
+      const requestStartedAt = Date.now();
       try {
         const authorization = req.get("authorization") || "";
         const match = authorization.match(/^Bearer\s+(.+)$/i);
         if (!match) return res.status(401).json({error: "Sign in is required"});
         const decoded = await admin.auth().verifyIdToken(match[1]);
+        const clientAttemptId = typeof (req.body && req.body.clientAttemptId) === "string" ?
+          req.body.clientAttemptId.slice(0, 80) : null;
+        console.info("[IAP-Subscription] verification request", JSON.stringify({
+          userTag: diagnosticTag(decoded.uid),
+          clientAttemptId,
+          purchaseRequestedAtMillis: req.body &&
+            req.body.purchaseRequestedAtMillis || null,
+        }));
         const signedTransaction = req.body && req.body.signedTransaction;
+        console.info("[IAP-Subscription] request authenticated", JSON.stringify({
+          userTag: diagnosticTag(decoded.uid),
+          clientAttemptId,
+          signedDataPresent: typeof signedTransaction === "string" &&
+            signedTransaction.length > 0,
+          signedDataLength: typeof signedTransaction === "string" ?
+            signedTransaction.length : 0,
+        }));
         const {transaction} = await verifyTransaction(signedTransaction);
+        console.info("[IAP-Subscription] transaction verified", JSON.stringify({
+          userTag: diagnosticTag(decoded.uid),
+          clientAttemptId,
+          productId: transaction.productId,
+          transactionTag: diagnosticTag(transaction.transactionId),
+          transactionSuffix: diagnosticSuffix(transaction.transactionId),
+          originalTransactionTag: diagnosticTag(
+              transaction.originalTransactionId),
+          purchaseDate: transaction.purchaseDate,
+          expiresDate: transaction.expiresDate,
+          revoked: Boolean(transaction.revocationDate),
+          environment: transaction.environment || null,
+        }));
         const purchaseRequestedAtMillis = Number(
             req.body && req.body.purchaseRequestedAtMillis);
         if (Number.isFinite(purchaseRequestedAtMillis) &&
             Number(transaction.purchaseDate) + 5000 <
               purchaseRequestedAtMillis) {
+          console.warn("[IAP-Subscription] stale transaction rejected", JSON.stringify({
+            userTag: diagnosticTag(decoded.uid),
+            clientAttemptId,
+            productId: transaction.productId,
+            transactionTag: diagnosticTag(transaction.transactionId),
+            transactionSuffix: diagnosticSuffix(transaction.transactionId),
+            purchaseRequestedAtMillis,
+            purchaseDate: transaction.purchaseDate,
+          }));
           return res.status(409).json({
             error: "Apple sent an older transaction, not a new subscription purchase.",
             code: "APPLE_OLD_TRANSACTION",
@@ -286,14 +336,35 @@ exports.verifyAppleSubscription = functions
         }
         if (transaction.revocationDate ||
             Number(transaction.expiresDate) <= Date.now()) {
+          console.warn("[IAP-Subscription] inactive transaction rejected", JSON.stringify({
+            userTag: diagnosticTag(decoded.uid),
+            clientAttemptId,
+            productId: transaction.productId,
+            transactionTag: diagnosticTag(transaction.transactionId),
+            transactionSuffix: diagnosticSuffix(transaction.transactionId),
+            expiresDate: transaction.expiresDate,
+            revoked: Boolean(transaction.revocationDate),
+          }));
           return res.status(402).json({
             error: "This App Store subscription is no longer active",
           });
         }
         await writeAppleEntitlement({uid: decoded.uid, transaction});
+        console.info("[IAP-Subscription] entitlement activated", JSON.stringify({
+          userTag: diagnosticTag(decoded.uid),
+          clientAttemptId,
+          productId: transaction.productId,
+          transactionTag: diagnosticTag(transaction.transactionId),
+          transactionSuffix: diagnosticSuffix(transaction.transactionId),
+        }));
         return res.status(200).json({ok: true});
       } catch (error) {
-        console.error("[verifyAppleSubscription]", error.message);
+        console.error("[verifyAppleSubscription]", JSON.stringify({
+          clientAttemptId: req.body && req.body.clientAttemptId || null,
+          elapsedMs: Date.now() - requestStartedAt,
+          errorCode: error.code || null,
+          error: error.message,
+        }));
         const status = error.code === "auth/argument-error" ||
           error.code === "auth/id-token-expired" ? 401 : 400;
         return res.status(status).json({
@@ -310,6 +381,7 @@ exports.verifyAppleSponsorship = functions
       if (req.method !== "POST") {
         return res.status(405).json({error: "POST required"});
       }
+      const requestStartedAt = Date.now();
       try {
         const authorization = req.get("authorization") || "";
         const match = authorization.match(/^Bearer\s+(.+)$/i);
@@ -317,15 +389,55 @@ exports.verifyAppleSponsorship = functions
           return res.status(401).json({error: "Sign in is required"});
         }
         const decoded = await admin.auth().verifyIdToken(match[1]);
+        const clientAttemptId = typeof (req.body && req.body.clientAttemptId) === "string" ?
+          req.body.clientAttemptId.slice(0, 80) : null;
+        const signedTransaction = req.body && req.body.signedTransaction;
+        console.info("[IAP-Sponsor] request authenticated", JSON.stringify({
+          userTag: diagnosticTag(decoded.uid),
+          clientAttemptId,
+          signedDataPresent: typeof signedTransaction === "string" &&
+            signedTransaction.length > 0,
+          signedDataLength: typeof signedTransaction === "string" ?
+            signedTransaction.length : 0,
+        }));
         const transaction = await verifyOneTimeTransaction(
-            req.body && req.body.signedTransaction);
+            signedTransaction);
+        console.info("[IAP-Sponsor] transaction verified", JSON.stringify({
+          userTag: diagnosticTag(decoded.uid),
+          clientAttemptId,
+          productId: transaction.productId,
+          transactionTag: diagnosticTag(transaction.transactionId),
+          transactionSuffix: diagnosticSuffix(transaction.transactionId),
+          purchaseDate: transaction.purchaseDate,
+          environment: transaction.environment || null,
+          revoked: Boolean(transaction.revocationDate),
+        }));
         if (transaction.revocationDate) {
+          console.warn("[IAP-Sponsor] refunded transaction rejected", JSON.stringify({
+            userTag: diagnosticTag(decoded.uid),
+            clientAttemptId,
+            productId: transaction.productId,
+            transactionTag: diagnosticTag(transaction.transactionId),
+            transactionSuffix: diagnosticSuffix(transaction.transactionId),
+          }));
           return res.status(402).json({error: "This purchase was refunded"});
         }
         await sponsorship.activateAppleSponsorship(decoded.uid, transaction);
+        console.info("[IAP-Sponsor] transaction applied", JSON.stringify({
+          userTag: diagnosticTag(decoded.uid),
+          clientAttemptId,
+          productId: transaction.productId,
+          transactionTag: diagnosticTag(transaction.transactionId),
+          transactionSuffix: diagnosticSuffix(transaction.transactionId),
+        }));
         return res.status(200).json({ok: true});
       } catch (error) {
-        console.error("[verifyAppleSponsorship]", error.message);
+        console.error("[verifyAppleSponsorship]", JSON.stringify({
+          clientAttemptId: req.body && req.body.clientAttemptId || null,
+          elapsedMs: Date.now() - requestStartedAt,
+          errorCode: error.code || null,
+          error: error.message,
+        }));
         const status = error.code === "auth/argument-error" ||
           error.code === "auth/id-token-expired" ? 401 :
           error.code === "APPLE_TRANSACTION_REPLAY" ? 409 : 400;

@@ -13,6 +13,16 @@ const LEDGER = "usage_ledger";
 const EVENTS = "stripe_webhook_events";
 const STRIPE_API = "https://api.stripe.com/v1";
 
+function diagnosticTag(value) {
+  return crypto.createHash("sha256").update(String(value || ""))
+      .digest("hex").slice(0, 10);
+}
+
+function diagnosticSuffix(value) {
+  const text = String(value || "");
+  return text ? text.slice(-6) : "none";
+}
+
 function appleLockId(uid, productId) {
   return crypto.createHash("sha256")
       .update(`${uid}:${productId}`).digest("hex");
@@ -253,6 +263,10 @@ async function getAppleSponsorshipProducts() {
 }
 
 async function startAppleSponsorship(uid, body) {
+  const userTag = diagnosticTag(uid);
+  const clientAttemptId = typeof body.clientAttemptId === "string" &&
+      /^[a-zA-Z0-9_-]{1,80}$/.test(body.clientAttemptId) ?
+    body.clientAttemptId : "missing-client-attempt-id";
   const tierId = id(body.tierId, "tierId");
   const productId = id(body.productId, "productId");
   const tierRef = db.collection(TIERS).doc(tierId);
@@ -261,6 +275,19 @@ async function startAppleSponsorship(uid, body) {
     throw new Error("This sponsor tier is not available");
   }
   const tier = tierSnap.data();
+  const attemptId = db.collection("sponsorships").doc().id;
+  console.info("[IAP-Sponsor] reservation requested", JSON.stringify({
+    attemptId,
+    clientAttemptId,
+    userTag,
+    tierId,
+    productId,
+    ownerType: tier.ownerType,
+    ownerId: tier.ownerId,
+    active: tier.active === true,
+    quantityFilled: tier.quantityFilled || 0,
+    quantityAvailable: tier.quantityAvailable || 0,
+  }));
   if (tier.appleProductId !== productId) {
     throw new Error("This tier is not assigned to that App Store sponsor plan");
   }
@@ -287,15 +314,39 @@ async function startAppleSponsorship(uid, body) {
   // so the transaction below does not see them.
   const pending = await db.collection(SPONSORSHIPS)
       .where("sponsorUserId", "==", uid).get();
-  for (const doc of pending.docs.filter((item) =>
+  const staleReservations = pending.docs.filter((item) =>
     item.get("appleProductId") === productId &&
-    item.get("status") === "PENDING_PAYMENT")) {
+    item.get("status") === "PENDING_PAYMENT");
+  console.info("[IAP-Sponsor] reservation cleanup", JSON.stringify({
+    attemptId,
+    clientAttemptId,
+    userTag,
+    productId,
+    stalePendingCount: staleReservations.length,
+    staleReservationIds: staleReservations.map((item) => item.id),
+  }));
+  for (const doc of staleReservations) {
     await releaseReservation(doc.id, "PAYMENT_REPLACED").catch(() => null);
   }
   // Delete the lock AFTER releasing reservations (releaseReservation also
   // deletes the lock if it matches, but do it unconditionally to be safe).
-  await db.collection("apple_sponsorship_pending")
-      .doc(appleLockId(uid, productId)).delete().catch(() => null);
+  const lockRef = db.collection("apple_sponsorship_pending")
+      .doc(appleLockId(uid, productId));
+  const oldLock = await lockRef.get();
+  console.info("[IAP-Sponsor] reservation lock cleanup", JSON.stringify({
+    attemptId,
+    clientAttemptId,
+    userTag,
+    productId,
+    lockFound: oldLock.exists,
+    lockReservationId: oldLock.exists ? oldLock.get("sponsorshipId") : null,
+    lockUserTag: oldLock.exists ? diagnosticTag(oldLock.get("userId")) : null,
+  }));
+  await lockRef.delete().catch((error) => {
+    console.error("[IAP-Sponsor] reservation lock delete failed", JSON.stringify({
+      attemptId, userTag, productId, error: error.message,
+    }));
+  });
 
   const owner = await getOwner(tier.ownerType, tier.ownerId);
   const sponsorUser = await db.collection("users").doc(uid).get();
@@ -323,12 +374,23 @@ async function startAppleSponsorship(uid, body) {
     }
     const filled = currentTier.get("quantityFilled") || 0;
     const available = currentTier.get("quantityAvailable") || 0;
+    console.info("[IAP-Sponsor] slot capacity checked", JSON.stringify({
+      attemptId,
+      userTag,
+      tierId,
+      productId,
+      quantityFilled: filled,
+      quantityAvailable: available,
+      quantityFilledAfterReservation: filled + 1,
+      slotAvailable: filled < available,
+    }));
     if (filled >= available) throw new Error("This sponsor tier is sold out");
     transaction.update(tierRef, {
       quantityFilled: filled + 1,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
     transaction.create(sponsorshipRef, {
+      clientAttemptId,
       tierId,
       ownerType: tier.ownerType,
       ownerId: tier.ownerId,
@@ -359,6 +421,14 @@ async function startAppleSponsorship(uid, body) {
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
   });
+  console.info("[IAP-Sponsor] reservation created", JSON.stringify({
+    attemptId,
+    clientAttemptId,
+    userTag,
+    sponsorshipId: sponsorshipRef.id,
+    tierId,
+    productId,
+  }));
   return {sponsorshipId: sponsorshipRef.id};
 }
 
@@ -380,7 +450,17 @@ async function cancelAppleSponsorship(uid, body) {
 }
 
 async function activateAppleSponsorship(uid, transactionInfo) {
+  const userTag = diagnosticTag(uid);
   const productId = id(transactionInfo.productId, "productId");
+  const transactionTag = diagnosticTag(transactionInfo.transactionId);
+  console.info("[IAP-Sponsor] verified transaction entering activation", JSON.stringify({
+    userTag,
+    transactionTag,
+    transactionSuffix: diagnosticSuffix(transactionInfo.transactionId),
+    productId,
+    environment: transactionInfo.environment || null,
+    purchaseDate: transactionInfo.purchaseDate || null,
+  }));
   const productRef = db.collection("apple_sponsorship_products").doc(productId);
   const productSnap = await productRef.get();
   if (!productSnap.exists) {
@@ -392,10 +472,64 @@ async function activateAppleSponsorship(uid, transactionInfo) {
       crypto.createHash("sha256")
           .update(`apple:${transactionId}`).digest("hex"));
   const previousPayment = await paymentRef.get();
+  console.info("[IAP-Sponsor] transaction lookup", JSON.stringify({
+    userTag,
+    transactionTag,
+    transactionSuffix: diagnosticSuffix(transactionInfo.transactionId),
+    productId,
+    paymentFound: previousPayment.exists,
+    previousSponsorTag: previousPayment.exists ?
+      diagnosticTag(previousPayment.get("sponsorUserId")) : null,
+    previousSponsorMatches: previousPayment.exists ?
+      previousPayment.get("sponsorUserId") === uid : null,
+    previousProductId: previousPayment.exists ?
+      previousPayment.get("productId") || null : null,
+    previousSponsorshipId: previousPayment.exists ?
+      previousPayment.get("sponsorshipId") || null : null,
+  }));
   if (previousPayment.exists) {
     if (previousPayment.get("sponsorUserId") !== uid) {
+      const currentUserPending = await db.collection(SPONSORSHIPS)
+          .where("sponsorUserId", "==", uid).get();
+      const matchingReservations = currentUserPending.docs.filter((item) =>
+        item.get("appleProductId") === productId &&
+        item.get("status") === "PENDING_PAYMENT");
+      console.error("[IAP-Sponsor] transaction already belongs to another account", JSON.stringify({
+        userTag,
+        previousSponsorTag: diagnosticTag(previousPayment.get("sponsorUserId")),
+        transactionTag,
+        transactionSuffix: diagnosticSuffix(transactionInfo.transactionId),
+        productId,
+        previousPaymentProductId: previousPayment.get("productId") || null,
+        previousPaymentSponsorshipId: previousPayment.get("sponsorshipId") || null,
+        currentAccountPending: matchingReservations.map((item) => ({
+          sponsorshipId: item.id,
+          tierId: item.get("tierId") || null,
+          ownerType: item.get("ownerType") || null,
+          ownerId: item.get("ownerId") || null,
+          clientAttemptId: item.get("clientAttemptId") || null,
+          status: item.get("status") || null,
+        })),
+      }));
       throw new Error("This App Store transaction is already in use");
     }
+    const sameAccountPending = await db.collection(SPONSORSHIPS)
+        .where("sponsorUserId", "==", uid).get();
+    console.info("[IAP-Sponsor] idempotent transaction replay", JSON.stringify({
+      userTag,
+      transactionTag,
+      transactionSuffix: diagnosticSuffix(transactionInfo.transactionId),
+      productId,
+      existingSponsorshipId: previousPayment.get("sponsorshipId") || null,
+      currentPendingReservations: sameAccountPending.docs
+          .filter((item) => item.get("appleProductId") === productId &&
+            item.get("status") === "PENDING_PAYMENT")
+          .map((item) => ({
+            sponsorshipId: item.id,
+            clientAttemptId: item.get("clientAttemptId") || null,
+            tierId: item.get("tierId") || null,
+          })),
+    }));
     return {success: true};
   }
   const pending = await db.collection(SPONSORSHIPS)
@@ -403,6 +537,17 @@ async function activateAppleSponsorship(uid, transactionInfo) {
   const matchingPending = pending.docs.filter((item) =>
     item.get("appleProductId") === productId &&
     item.get("status") === "PENDING_PAYMENT");
+  console.info("[IAP-Sponsor] pending reservation match", JSON.stringify({
+    userTag,
+    transactionTag,
+    transactionSuffix: diagnosticSuffix(transactionInfo.transactionId),
+    productId,
+    userPendingCount: pending.size,
+    matchingPendingCount: matchingPending.length,
+    matchingReservationIds: matchingPending.map((item) => item.id),
+    clientAttemptIds: matchingPending.map((item) =>
+      item.get("clientAttemptId") || null),
+  }));
   if (matchingPending.length === 0) {
     throw new Error("Could not match the App Store payment to a pending sponsorship");
   }
@@ -428,6 +573,18 @@ async function activateAppleSponsorship(uid, transactionInfo) {
     if (!sponsorship.exists || sponsorship.get("sponsorUserId") !== uid ||
         sponsorship.get("status") !== "PENDING_PAYMENT" ||
         sponsorship.get("appleProductId") !== productId) {
+      console.error("[IAP-Sponsor] reservation no longer matches", JSON.stringify({
+        userTag,
+        transactionTag,
+        productId,
+        sponsorshipId,
+        exists: sponsorship.exists,
+        status: sponsorship.exists ? sponsorship.get("status") : null,
+        sponsorMatches: sponsorship.exists ?
+          sponsorship.get("sponsorUserId") === uid : null,
+        reservationProductId: sponsorship.exists ?
+          sponsorship.get("appleProductId") || null : null,
+      }));
       throw new Error("This App Store sponsorship is no longer payable");
     }
     const details = sponsorship.data();
@@ -461,6 +618,12 @@ async function activateAppleSponsorship(uid, transactionInfo) {
       transaction.delete(lockRef);
     }
   });
+  console.info("[IAP-Sponsor] sponsorship activated", JSON.stringify({
+    userTag,
+    transactionTag,
+    productId,
+    sponsorshipId,
+  }));
   return {success: true};
 }
 
@@ -530,7 +693,15 @@ async function releaseReservation(sponsorshipId, finalStatus) {
   const sponsorshipRef = db.collection(SPONSORSHIPS).doc(sponsorshipId);
   await db.runTransaction(async (transaction) => {
     const sponsorship = await transaction.get(sponsorshipRef);
-    if (!sponsorship.exists || sponsorship.get("status") !== "PENDING_PAYMENT") return;
+    if (!sponsorship.exists || sponsorship.get("status") !== "PENDING_PAYMENT") {
+      console.info("[IAP-Sponsor] reservation release skipped", JSON.stringify({
+        sponsorshipId,
+        requestedFinalStatus: finalStatus,
+        exists: sponsorship.exists,
+        currentStatus: sponsorship.exists ? sponsorship.get("status") : null,
+      }));
+      return;
+    }
     const tierRef = db.collection(TIERS).doc(sponsorship.get("tierId"));
     const tier = await transaction.get(tierRef);
     const lockRef = sponsorship.get("appleProductId") ?
@@ -539,6 +710,16 @@ async function releaseReservation(sponsorshipId, finalStatus) {
               sponsorship.get("appleProductId"))) : null;
     const lock = lockRef ? await transaction.get(lockRef) : null;
     if (tier.exists) {
+      console.info("[IAP-Sponsor] reservation slot released", JSON.stringify({
+        sponsorshipId,
+        clientAttemptId: sponsorship.get("clientAttemptId") || null,
+        tierId: sponsorship.get("tierId") || null,
+        productId: sponsorship.get("appleProductId") || null,
+        previousQuantityFilled: tier.get("quantityFilled") || 0,
+        quantityAvailable: tier.get("quantityAvailable") || 0,
+        newQuantityFilled: Math.max(0, (tier.get("quantityFilled") || 0) - 1),
+        finalStatus,
+      }));
       transaction.update(tierRef, {
         quantityFilled: Math.max(0, (tier.get("quantityFilled") || 0) - 1),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -963,9 +1144,24 @@ exports.sponsorshipApi = functions
       responseCors(req, res);
       if (req.method === "OPTIONS") return res.status(204).send("");
       if (req.method !== "POST") return res.status(405).json({error: "POST required"});
+      let requestUserTag = null;
+      let requestAction = null;
+      const requestStartedAt = Date.now();
       try {
         const user = await requireUser(req);
+        requestUserTag = diagnosticTag(user.uid);
         const body = req.body || {};
+        requestAction = body.action || null;
+        if (typeof requestAction === "string" &&
+            requestAction.includes("apple_sponsorship")) {
+          console.info("[IAP-Sponsor] API request", JSON.stringify({
+            userTag: requestUserTag,
+            action: requestAction,
+            clientAttemptId: body.clientAttemptId || null,
+            productId: body.productId || null,
+            tierId: body.tierId || null,
+          }));
+        }
         let result;
         switch (body.action) {
           case "create_tier": result = await createTier(user.uid, body); break;
@@ -983,9 +1179,26 @@ exports.sponsorshipApi = functions
           case "reject_artwork": result = await moderateArtwork(user.uid, body, false); break;
           default: throw new Error("Unknown sponsorship action");
         }
+        if (typeof requestAction === "string" &&
+            requestAction.includes("apple_sponsorship")) {
+          console.info("[IAP-Sponsor] API response", JSON.stringify({
+            userTag: requestUserTag,
+            action: requestAction,
+            clientAttemptId: body.clientAttemptId || null,
+            elapsedMs: Date.now() - requestStartedAt,
+            success: true,
+            sponsorshipId: result && result.sponsorshipId || null,
+          }));
+        }
         return res.status(200).json(result);
       } catch (error) {
-        console.error("[sponsorshipApi] Request failed", error.message);
+        console.error("[sponsorshipApi] Request failed", JSON.stringify({
+          userTag: requestUserTag,
+          action: requestAction,
+          elapsedMs: Date.now() - requestStartedAt,
+          errorCode: error.code || null,
+          error: error.message,
+        }));
         const denied = /Sign in|owner can|Admin access|not authorized/.test(error.message);
         return res.status(denied ? 403 : 400).json({error: error.message});
       }

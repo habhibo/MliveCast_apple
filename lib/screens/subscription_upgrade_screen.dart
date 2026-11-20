@@ -31,6 +31,8 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
   final Set<String> _purchaseNotificationsShown = {};
   final Set<String> _handledPurchaseUpdates = {};
   final Set<String> _requestedProductIds = {};
+  final Map<String, String> _requestedAttemptIds = {};
+  String? _activeAppleAttemptId;
   Timer? _restoreRequestWindow;
   Timer? _purchaseTimeout;
   bool _isRestoringPurchases = false;
@@ -66,6 +68,15 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
   bool get _usesAppleIap =>
       !kIsWeb && defaultTargetPlatform == TargetPlatform.iOS;
 
+  void _iapLog(String attemptId, String message) {
+    debugPrint('[IAP-Sub][$attemptId] ${DateTime.now().toIso8601String()} $message');
+  }
+
+  String _purchaseIdSuffix(String? value) {
+    if (value == null || value.isEmpty) return 'none';
+    return value.substring(value.length > 6 ? value.length - 6 : 0);
+  }
+
   @override
   void initState() {
     super.initState();
@@ -73,6 +84,7 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
       _purchaseUpdates = _store.purchaseStream.listen(
         _onPurchaseUpdates,
         onError: (Object error) {
+          _iapLog(_activeAppleAttemptId ?? 'background', 'purchaseStream error=$error');
           if (mounted) {
             setState(() => _storeError = 'The App Store purchase service is unavailable.');
           }
@@ -83,7 +95,12 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
       // The existing listener will silently complete them (restored events are
       // ignored when _isRestoringPurchases == false). This clears the queue
       // so the payment sheet can appear on the next purchase attempt.
-      _store.restorePurchases().catchError((_) {});
+      _iapLog('startup', 'restorePurchases begin');
+      _store.restorePurchases().then((_) {
+        _iapLog('startup', 'restorePurchases future returned');
+      }).catchError((Object error) {
+        _iapLog('startup', 'restorePurchases future failed error=$error');
+      });
     }
     _loadData();
   }
@@ -97,8 +114,11 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
   }
 
   Future<void> _loadAppleProducts() async {
+    final stopwatch = Stopwatch()..start();
     try {
+      _iapLog('catalog', 'product load started');
       final available = await _store.isAvailable();
+      _iapLog('catalog', 'isAvailable=$available elapsedMs=${stopwatch.elapsedMilliseconds}');
       if (!available) {
         if (mounted) setState(() => _storeError = 'The App Store is not available right now.');
         return;
@@ -106,6 +126,10 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
       final response = await _store.queryProductDetails(
         AppleSubscriptionService.productToPlan.keys.toSet(),
       );
+      _iapLog('catalog', 'requested=${AppleSubscriptionService.productToPlan.keys.toList()} '
+          'returned=${response.productDetails.map((product) => product.id).toList()} '
+          'notFound=${response.notFoundIDs} error=${response.error} '
+          'elapsedMs=${stopwatch.elapsedMilliseconds}');
       if (mounted) {
         setState(() {
           _storeAvailable = true;
@@ -117,6 +141,7 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
         });
       }
     } catch (error) {
+      _iapLog('catalog', 'load failed elapsedMs=${stopwatch.elapsedMilliseconds} error=$error');
       if (mounted) setState(() => _storeError = 'Could not load App Store subscriptions.');
     }
   }
@@ -125,12 +150,16 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
     bool hasCompletedPurchases = false;
 
     for (final purchase in purchases) {
-      // Diagnostic log — visible in Xcode console / device logs
-      debugPrint('[IAP-Sub] stream event: productID=${purchase.productID} '
+      final eventAttempt = _requestedAttemptIds[purchase.productID] ??
+          _activeAppleAttemptId ?? 'background';
+      _iapLog(eventAttempt, 'purchaseStream event productID=${purchase.productID} '
           'status=${purchase.status.name} '
-          'purchaseID=${purchase.purchaseID} '
+          'transactionSuffix=${_purchaseIdSuffix(purchase.purchaseID)} '
+          'transactionDate=${purchase.transactionDate ?? 'none'} '
           'pendingComplete=${purchase.pendingCompletePurchase} '
-          'requested=${_requestedProductIds.contains(purchase.productID)}');
+          'requested=${_requestedProductIds.contains(purchase.productID)} '
+          'restoring=$_isRestoringPurchases processing=$_isProcessing '
+          'error=${purchase.error?.code ?? 'none'}:${purchase.error?.message ?? 'none'}');
 
       // 1. Only process subscriptions configured for this screen
       if (!AppleSubscriptionService.productToPlan.containsKey(purchase.productID)) {
@@ -141,6 +170,7 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
           '${purchase.productID}:${purchase.transactionDate ?? ''}:${purchase.status.name}';
 
       if (purchase.status == PurchaseStatus.pending) {
+        _iapLog(eventAttempt, 'StoreKit explicitly reported PENDING');
         // Only show the spinner for a plan the user explicitly tapped.
         // Startup-replayed StoreKit queue items arrive as "pending" too;
         // setting _isProcessing for those blocks all subscription buttons.
@@ -152,6 +182,7 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
 
       if (purchase.status == PurchaseStatus.canceled || purchase.status == PurchaseStatus.error) {
         final wasRequested = _requestedProductIds.remove(purchase.productID);
+        _requestedAttemptIds.remove(purchase.productID);
         if (purchase.pendingCompletePurchase) {
           try {
             await _store.completePurchase(purchase);
@@ -168,14 +199,18 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
             _showMessage(purchase.error?.message ?? 'The App Store purchase could not be completed.');
           }
         }
+        _iapLog(eventAttempt, 'terminal event handled wasRequested=$wasRequested '
+            'completeCalled=${purchase.pendingCompletePurchase}');
         continue;
       }
 
       if (purchase.status == PurchaseStatus.purchased ||
           purchase.status == PurchaseStatus.restored) {
         final wasRequested = _requestedProductIds.remove(purchase.productID);
+        _requestedAttemptIds.remove(purchase.productID);
         final isRestore = _isRestoringPurchases;
         if (purchase.status == PurchaseStatus.restored && !_isRestoringPurchases) {
+          _iapLog(eventAttempt, 'restored transaction ignored outside explicit Restore flow');
           if (purchase.pendingCompletePurchase) {
             await _store.completePurchase(purchase);
           }
@@ -183,6 +218,7 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
         }
 
         if (!_handledPurchaseUpdates.add(transactionKey)) {
+          _iapLog(eventAttempt, 'duplicate transaction update ignored key=$transactionKey');
           if (purchase.pendingCompletePurchase) {
             try {
               await _store.completePurchase(purchase);
@@ -195,17 +231,22 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
 
         bool backendSuccess = false;
         try {
+          _iapLog(eventAttempt, 'backend verify begin transactionSuffix=${_purchaseIdSuffix(purchase.purchaseID)}');
           await _appleSubscriptions.verifyAndActivate(
             purchase.verificationData.serverVerificationData,
+            clientAttemptId: eventAttempt,
           );
           backendSuccess = true;
+          _iapLog(eventAttempt, 'backend verify succeeded');
         } catch (error) {
+          _iapLog(eventAttempt, 'backend verify failed error=$error');
           debugPrint('Backend Apple subscription verification failed: $error');
         }
 
         // Direct client fallback: if backend verification failed or was unreachable,
         // activate premium in Firestore since Apple confirmed the purchase.
         if (!backendSuccess) {
+          _iapLog(eventAttempt, 'direct Firestore fallback begin after backend failure');
           try {
             final currentUser = FirebaseAuth.instance.currentUser;
             if (currentUser != null) {
@@ -224,8 +265,10 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
                 'updatedAt': FieldValue.serverTimestamp(),
               }, SetOptions(merge: true));
               backendSuccess = true;
+              _iapLog(eventAttempt, 'direct Firestore fallback wrote premium documents');
             }
           } catch (e) {
+            _iapLog(eventAttempt, 'direct Firestore fallback failed error=$e');
             debugPrint('Client fallback subscription update failed: $e');
           }
         }
@@ -233,6 +276,7 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
         try {
           if (purchase.pendingCompletePurchase) {
             await _store.completePurchase(purchase);
+            _iapLog(eventAttempt, 'completePurchase succeeded');
           }
           hasCompletedPurchases = true;
           if (mounted && (wasRequested || isRestore)) {
@@ -246,6 +290,7 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
             }
           }
         } catch (e) {
+          _iapLog(eventAttempt, 'completePurchase failed error=$e');
           debugPrint('Error completing purchase: $e');
         } finally {
           _purchaseTimeout?.cancel();
@@ -268,6 +313,9 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
   }
 
   Future<void> _buyApplePlan(SubscriptionPlan plan) async {
+    final attemptId = 'sub-${DateTime.now().microsecondsSinceEpoch}';
+    _activeAppleAttemptId = attemptId;
+    final attemptTimer = Stopwatch()..start();
     final productIds = AppleSubscriptionService.productToPlan.entries
         .where((entry) => entry.value == plan.id)
         .map((entry) => entry.key)
@@ -275,8 +323,7 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
     final productId = productIds.isEmpty ? null : productIds.first;
     final product = productId == null ? null : _storeProducts[productId];
 
-    // ── Diagnostic: always visible so we know exactly what's happening ──
-    debugPrint('[IAP-Sub] plan=${plan.id} productId=$productId '
+    _iapLog(attemptId, 'buy tap plan=${plan.id} productId=$productId '
         'storeAvailable=$_storeAvailable '
         'productFound=${product != null} '
         'storeError=$_storeError '
@@ -293,6 +340,7 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
       return;
     }
     _requestedProductIds.add(productId);
+    _requestedAttemptIds[productId] = attemptId;
     setState(() {
       _processingPlanId = plan.id;
       _isProcessing = true;
@@ -302,14 +350,20 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
     // StoreKit queues the new payment but never shows the payment sheet.
     // restorePurchases() replays all queue entries → our existing listener
     // calls completePurchase on each one → queue is clean after the wait.
+    _iapLog(attemptId, 'pre-purchase restorePurchases begin');
     _showMessage('Clearing Apple queue…');
     try {
       await _store.restorePurchases();
-    } catch (_) {}
+      _iapLog(attemptId, 'restorePurchases future returned elapsedMs=${attemptTimer.elapsedMilliseconds}');
+    } catch (error) {
+      _iapLog(attemptId, 'restorePurchases future failed elapsedMs=${attemptTimer.elapsedMilliseconds} error=$error');
+    }
     // Give StoreKit 3 s to deliver and complete all pending events.
     await Future<void>.delayed(const Duration(seconds: 3));
+    _iapLog(attemptId, 'queue-drain wait ended elapsedMs=${attemptTimer.elapsedMilliseconds}');
     if (!mounted) {
       _requestedProductIds.remove(productId);
+      _requestedAttemptIds.remove(productId);
       return;
     }
     // Step 2: attempt the actual purchase on a clean queue.
@@ -317,6 +371,9 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
     _purchaseTimeout?.cancel();
     _purchaseTimeout = Timer(const Duration(seconds: 30), () {
       if (mounted && _isProcessing) {
+        _iapLog(attemptId, '30s timeout fired elapsedMs=${attemptTimer.elapsedMilliseconds} '
+            'requested=${_requestedProductIds.contains(productId)} '
+            'activeAttempt=${_activeAppleAttemptId == attemptId}');
         setState(() {
           _processingPlanId = null;
           _isProcessing = false;
@@ -325,13 +382,15 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
       }
     });
     try {
+      _iapLog(attemptId, 'buyNonConsumable call begin product=$productId');
       final started = await _store.buyNonConsumable(
         purchaseParam: PurchaseParam(productDetails: product),
       );
-      debugPrint('[IAP-Sub] buyNonConsumable returned: $started for $productId');
+      _iapLog(attemptId, 'buyNonConsumable future returned started=$started elapsedMs=${attemptTimer.elapsedMilliseconds}');
       if (!started) {
         _purchaseTimeout?.cancel();
         _requestedProductIds.remove(productId);
+        _requestedAttemptIds.remove(productId);
         if (mounted) {
           setState(() {
             _processingPlanId = null;
@@ -345,7 +404,8 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
     } catch (error) {
       _purchaseTimeout?.cancel();
       _requestedProductIds.remove(productId);
-      debugPrint('[IAP-Sub] buyNonConsumable exception: $error');
+      _requestedAttemptIds.remove(productId);
+      _iapLog(attemptId, 'buyNonConsumable future threw elapsedMs=${attemptTimer.elapsedMilliseconds} error=$error');
       if (mounted) {
         setState(() {
           _processingPlanId = null;

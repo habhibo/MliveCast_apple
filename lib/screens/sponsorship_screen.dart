@@ -38,6 +38,7 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
   final Map<String, Map<String, dynamic>> _appleCatalog = {};
   final Map<String, ProductDetails> _appleProducts = {};
   final Set<String> _requestedSponsorProductIds = {};
+  String? _activeAppleAttemptId;
   int _durationMonths = 1;
   String? _busyKey;
   bool _applePurchasePending = false;
@@ -68,6 +69,16 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
   }
 
+  void _appleLog(String message) {
+    debugPrint('[IAP-Sponsor][${_activeAppleAttemptId ?? 'background'}] '
+        '${DateTime.now().toIso8601String()} $message');
+  }
+
+  String _purchaseIdSuffix(String? value) {
+    if (value == null || value.isEmpty) return 'none';
+    return value.substring(value.length > 6 ? value.length - 6 : 0);
+  }
+
   @override
   void initState() {
     super.initState();
@@ -75,6 +86,7 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
       _purchaseUpdates = _store.purchaseStream.listen(
         _handleApplePurchases,
         onError: (Object error) {
+          _appleLog('purchaseStream error=$error');
           if (mounted) {
             setState(() => _applePurchaseError =
                 'Apple purchases are unavailable right now.');
@@ -92,8 +104,12 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
   }
 
   Future<void> _loadAppleSponsorshipProducts() async {
+    final stopwatch = Stopwatch()..start();
     try {
-      if (!await _store.isAvailable()) {
+      _appleLog('catalog load started');
+      final available = await _store.isAvailable();
+      _appleLog('store availability=$available elapsedMs=${stopwatch.elapsedMilliseconds}');
+      if (!available) {
         throw StateError('The App Store is not available right now.');
       }
       final configured = await _service.getAppleSponsorshipProducts();
@@ -109,6 +125,10 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
         return;
       }
       final response = await _store.queryProductDetails(catalog.keys.toSet());
+      _appleLog('catalog query configured=${catalog.keys.toList()} '
+          'returned=${response.productDetails.map((item) => item.id).toList()} '
+          'notFound=${response.notFoundIDs} error=${response.error} '
+          'elapsedMs=${stopwatch.elapsedMilliseconds}');
       if (!mounted) return;
       setState(() {
         _appleCatalog
@@ -134,8 +154,14 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
       // transactions (e.g. from a previous failed purchase). The existing
       // _purchaseUpdates listener will silently complete them so that
       // future buyNonConsumable calls don't get "already in use".
-      _store.restorePurchases().catchError((_) {});
+      _appleLog('startup restorePurchases begin');
+      _store.restorePurchases().then((_) {
+        _appleLog('startup restorePurchases future returned');
+      }).catchError((Object error) {
+        _appleLog('startup restorePurchases future failed error=$error');
+      });
     } catch (error) {
+      _appleLog('catalog load failed elapsedMs=${stopwatch.elapsedMilliseconds} error=$error');
       if (mounted) {
         setState(() => _applePurchaseError =
             error.toString().replaceFirst('Bad state: ', ''));
@@ -144,10 +170,21 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
   }
 
   Future<void> _handleApplePurchases(List<PurchaseDetails> purchases) async {
+    _appleLog('purchaseStream batch size=${purchases.length}');
     for (final purchase in purchases) {
-      if (!_appleCatalog.containsKey(purchase.productID)) continue;
+      _appleLog('event product=${purchase.productID} status=${purchase.status.name} '
+          'transactionSuffix=${_purchaseIdSuffix(purchase.purchaseID)} '
+          'transactionDate=${purchase.transactionDate ?? 'none'} '
+          'pendingComplete=${purchase.pendingCompletePurchase} '
+          'requested=${_requestedSponsorProductIds.contains(purchase.productID)} '
+          'error=${purchase.error?.code ?? 'none'}:${purchase.error?.message ?? 'none'}');
+      if (!_appleCatalog.containsKey(purchase.productID)) {
+        _appleLog('event ignored because product is absent from current Firestore catalog');
+        continue;
+      }
 
       if (purchase.status == PurchaseStatus.pending) {
+        _appleLog('Apple reports PENDING for ${purchase.productID}');
         // Only block the UI for products the user explicitly tapped.
         // Startup-replayed orphaned pending transactions must NOT disable buttons.
         if (_requestedSponsorProductIds.contains(purchase.productID)) {
@@ -164,6 +201,8 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
         if (purchase.pendingCompletePurchase) {
           await _store.completePurchase(purchase).catchError((_) {});
         }
+        _appleLog('terminal StoreKit event handled status=${purchase.status.name} '
+            'completeCalled=${purchase.pendingCompletePurchase}');
         if (mounted) {
           setState(() => _applePurchasePending = false);
           // Only show error messages for products the user explicitly tapped.
@@ -185,6 +224,7 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
       // For restored events that the user did NOT request: just complete them silently.
       final wasRequested = _requestedSponsorProductIds.remove(purchase.productID);
       if (purchase.status == PurchaseStatus.restored && !wasRequested) {
+        _appleLog('restored event not initiated by this screen; completing silently');
         if (purchase.pendingCompletePurchase) {
           await _store.completePurchase(purchase).catchError((_) {});
         }
@@ -192,18 +232,26 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
       }
 
       try {
+        _appleLog('server verification begin product=${purchase.productID} '
+            'transactionSuffix=${_purchaseIdSuffix(purchase.purchaseID)}');
         await _service.verifyAppleSponsorship(
-            purchase.verificationData.serverVerificationData);
+          purchase.verificationData.serverVerificationData,
+          clientAttemptId: _activeAppleAttemptId ?? 'background',
+        );
+        _appleLog('server verification succeeded product=${purchase.productID}');
         if (mounted && purchase.status == PurchaseStatus.purchased) {
           _message('Sponsorship payment confirmed.');
         }
       } catch (error) {
+        _appleLog('server verification failed product=${purchase.productID} '
+            'transactionSuffix=${_purchaseIdSuffix(purchase.purchaseID)} error=$error');
         if (mounted) {
           _message(error.toString().replaceFirst('Exception: ', ''));
         }
       } finally {
         if (purchase.pendingCompletePurchase) {
           await _store.completePurchase(purchase).catchError((_) {});
+          _appleLog('completePurchase called after verification attempt');
         }
         if (mounted) setState(() => _applePurchasePending = false);
       }
@@ -261,14 +309,21 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
   }
 
   Future<void> _buyAppleTier(String tierId, Map<String, dynamic> tier) async {
+    final attemptId = 'sp-${DateTime.now().microsecondsSinceEpoch}';
+    _activeAppleAttemptId = attemptId;
+    final attemptTimer = Stopwatch()..start();
     final matched = _appleProductForTier(tier);
     if (matched == null) {
+      _appleLog('tap rejected before StoreKit; no matching loaded product tier=$tierId');
       throw Exception(_applePurchaseError ??
           'This tier does not use an available App Store sponsor plan.');
     }
+    _appleLog('tap tier=$tierId product=${matched.key} ownerType=${widget.ownerType} '
+        'ownerId=${widget.ownerId} durationMonths=$_durationMonths');
     // Auto-clear any abandoned stale pending reservation for this product
     try {
       await _service.cancelPendingAppleSponsorship(matched.key);
+      _appleLog('old reservation cleanup API returned elapsedMs=${attemptTimer.elapsedMilliseconds}');
     } catch (_) {}
 
     // Drain any stuck StoreKit transactions BEFORE creating the backend record.
@@ -276,27 +331,37 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
     // left an unfinished transaction in the queue. restorePurchases() replays
     // those entries → the existing listener completes them → clean queue.
     if (mounted) setState(() => _applePurchasePending = true);
+    _appleLog('pre-purchase restorePurchases begin');
     try {
       await _store.restorePurchases();
-    } catch (_) {}
+      _appleLog('pre-purchase restorePurchases future returned elapsedMs=${attemptTimer.elapsedMilliseconds}');
+    } catch (error) {
+      _appleLog('pre-purchase restorePurchases future failed error=$error');
+    }
     await Future<void>.delayed(const Duration(seconds: 3));
+    _appleLog('pre-purchase queue-drain delay ended elapsedMs=${attemptTimer.elapsedMilliseconds}');
     if (!mounted) {
       setState(() => _applePurchasePending = false);
       return;
     }
 
-    await _service.startAppleSponsorship(
+    final reservationId = await _service.startAppleSponsorship(
       tierId: tierId,
       productId: matched.key,
       durationMonths: _durationMonths,
+      clientAttemptId: attemptId,
     );
+    _appleLog('server reservation created id=$reservationId elapsedMs=${attemptTimer.elapsedMilliseconds}');
     _requestedSponsorProductIds.add(matched.key);
     bool started = false;
     try {
+      _appleLog('buyNonConsumable call begin product=${matched.key}');
       started = await _store.buyNonConsumable(
         purchaseParam: PurchaseParam(productDetails: matched.value),
       );
+      _appleLog('buyNonConsumable future returned started=$started elapsedMs=${attemptTimer.elapsedMilliseconds}');
     } catch (e) {
+      _appleLog('buyNonConsumable future threw elapsedMs=${attemptTimer.elapsedMilliseconds} error=$e');
       debugPrint('StoreKit buyNonConsumable failed: $e');
       started = false;
     }
@@ -306,6 +371,7 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
         await _service.cancelPendingAppleSponsorship(matched.key);
       } catch (_) {}
       if (mounted) setState(() => _applePurchasePending = false);
+      _appleLog('StoreKit purchase did not start; server reservation cancellation requested');
       throw Exception('The App Store purchase did not start. Try again.');
     }
   }
@@ -320,6 +386,10 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
   }
 
   Future<void> _resumeApplePayment(String docId, String tierId, String appleProductId) async {
+    final attemptId = 'sp-retry-${DateTime.now().microsecondsSinceEpoch}';
+    _activeAppleAttemptId = attemptId;
+    final attemptTimer = Stopwatch()..start();
+    _appleLog('Pay now tapped sponsorshipId=$docId tierId=$tierId product=$appleProductId');
     final product = _appleProducts[appleProductId];
     if (product == null) {
       _message('Apple product details are not ready. Please wait and try again.');
@@ -329,33 +399,44 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
     // has a valid record to match when Apple calls back with the transaction.
     try {
       await _service.cancelPendingAppleSponsorship(appleProductId);
+      _appleLog('Pay now old reservation cleanup returned');
     } catch (_) {}
 
     // Drain stuck StoreKit queue before attempting the purchase.
     if (mounted) setState(() => _applePurchasePending = true);
+    _appleLog('Pay now restorePurchases begin');
     try {
       await _store.restorePurchases();
-    } catch (_) {}
+      _appleLog('Pay now restorePurchases future returned elapsedMs=${attemptTimer.elapsedMilliseconds}');
+    } catch (error) {
+      _appleLog('Pay now restorePurchases future failed error=$error');
+    }
     await Future<void>.delayed(const Duration(seconds: 3));
+    _appleLog('Pay now queue-drain delay ended elapsedMs=${attemptTimer.elapsedMilliseconds}');
     if (!mounted) {
       setState(() => _applePurchasePending = false);
       return;
     }
 
-    await _service.startAppleSponsorship(
+    final reservationId = await _service.startAppleSponsorship(
       tierId: tierId,
       productId: appleProductId,
       durationMonths: _durationMonths,
+      clientAttemptId: attemptId,
     );
+    _appleLog('Pay now server reservation created id=$reservationId elapsedMs=${attemptTimer.elapsedMilliseconds}');
     _requestedSponsorProductIds.add(appleProductId);
     bool started = false;
     try {
       // Sponsorship products are NON-RENEWING SUBSCRIPTIONS in App Store Connect.
       // buyNonConsumable is correct for non-renewing subscription product types.
+      _appleLog('Pay now buyNonConsumable call begin product=$appleProductId');
       started = await _store.buyNonConsumable(
         purchaseParam: PurchaseParam(productDetails: product),
       );
+      _appleLog('Pay now buyNonConsumable future returned started=$started elapsedMs=${attemptTimer.elapsedMilliseconds}');
     } catch (e) {
+      _appleLog('Pay now buyNonConsumable future threw error=$e');
       debugPrint('StoreKit buyNonConsumable (resume) failed: $e');
       started = false;
     }
@@ -365,6 +446,7 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
         await _service.cancelPendingAppleSponsorship(appleProductId);
       } catch (_) {}
       if (mounted) setState(() => _applePurchasePending = false);
+      _appleLog('Pay now StoreKit start failed; cancellation requested');
       _message('The App Store purchase did not start. Please try again.');
     }
   }
@@ -560,6 +642,18 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
     return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
       stream: _service.watchTiers(ownerType: widget.ownerType, ownerId: widget.ownerId),
       builder: (context, snapshot) {
+        final rawDocs = snapshot.data?.docs ?? [];
+        _appleLog('available tiers snapshot ownerType=${widget.ownerType} ownerId=${widget.ownerId} '
+            'connection=${snapshot.connectionState.name} hasError=${snapshot.hasError} '
+            'error=${snapshot.error ?? 'none'} '
+            'fromCache=${snapshot.data?.metadata.isFromCache ?? 'n/a'} '
+            'tiers=${rawDocs.map((doc) => <String, Object?>{
+              'tierId': doc.id,
+              'active': doc.data()['active'],
+              'appleProductId': doc.data()['appleProductId'],
+              'quantityFilled': doc.data()['quantityFilled'],
+              'quantityAvailable': doc.data()['quantityAvailable'],
+            }).toList()}');
         final docs = snapshot.data?.docs.where((doc) {
           if (doc.data()['active'] != true) return false;
           if (_requiresAppleIap) {
@@ -588,6 +682,13 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
       stream: _service.watchTiers(ownerType: widget.ownerType, ownerId: widget.ownerId),
       builder: (context, snapshot) {
         final docs = snapshot.data?.docs ?? [];
+        _appleLog('owner tiers snapshot ownerType=${widget.ownerType} ownerId=${widget.ownerId} '
+            'connection=${snapshot.connectionState.name} hasError=${snapshot.hasError} '
+            'error=${snapshot.error ?? 'none'} '
+            'fromCache=${snapshot.data?.metadata.isFromCache ?? 'n/a'} '
+            'tiers=${docs.map((doc) => '${doc.id}:${doc.data()['active']}:'
+              '${doc.data()['quantityFilled']}/${doc.data()['quantityAvailable']}:'
+              '${doc.data()['appleProductId']}').toList()}');
         return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           Row(children: [
             const Expanded(child: _SectionHeading('YOUR TIERS')),
@@ -902,6 +1003,11 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
       stream: _service.watchMySponsorships(ownerType: widget.ownerType, ownerId: widget.ownerId),
       builder: (context, snapshot) {
         final docs = snapshot.data?.docs ?? [];
+        _appleLog('my sponsorships snapshot ownerType=${widget.ownerType} ownerId=${widget.ownerId} '
+            'connection=${snapshot.connectionState.name} hasError=${snapshot.hasError} '
+            'error=${snapshot.error ?? 'none'} '
+            'rows=${docs.map((doc) => '${doc.id}:${doc.data()['status']}:'
+              '${doc.data()['appleProductId']}:${doc.data()['tierId']}').toList()}');
         if (docs.isEmpty) return const SizedBox.shrink();
         return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           const _SectionHeading('YOUR SPONSORSHIPS'),

@@ -32,6 +32,7 @@ class AppleSubscriptionService {
   Future<void> verifyAndActivate(
     String signedTransaction, {
     int? purchaseRequestedAtMillis,
+    String? clientAttemptId,
   }) async {
     final user = FirebaseAuth.instance.currentUser;
     if (user == null) throw StateError('Sign in before buying a subscription.');
@@ -48,6 +49,11 @@ class AppleSubscriptionService {
     if (token == null || token.isEmpty) {
       throw StateError('Could not authenticate with Firebase. Sign in again and retry.');
     }
+    final stopwatch = Stopwatch()..start();
+    debugPrint('[IAP-Sub][verify] start project=$projectId '
+        'clientAttemptId=${clientAttemptId ?? 'background'} '
+        'signedDataPresent=${signedTransaction.isNotEmpty} '
+        'signedDataLength=${signedTransaction.length}');
     final response = await http.post(
       Uri.parse(
         'https://us-central1-$projectId.cloudfunctions.net/verifyAppleSubscription',
@@ -58,17 +64,22 @@ class AppleSubscriptionService {
       },
       body: jsonEncode({
         'signedTransaction': signedTransaction,
+        if (clientAttemptId != null) 'clientAttemptId': clientAttemptId,
         if (purchaseRequestedAtMillis != null)
           'purchaseRequestedAtMillis': purchaseRequestedAtMillis,
       }),
     );
 
     if (response.statusCode == 409) {
+      debugPrint('[IAP-Sub][verify] stale response http=409 '
+          'elapsedMs=${stopwatch.elapsedMilliseconds}');
       throw const AppleSubscriptionStaleTransactionException(
         'Apple returned an older transaction; no new subscription was purchased.',
       );
     }
     if (response.statusCode == 402) {
+      debugPrint('[IAP-Sub][verify] inactive response http=402 '
+          'elapsedMs=${stopwatch.elapsedMilliseconds}');
       throw const AppleSubscriptionInactiveException(
         'Apple returned an expired or revoked subscription transaction.',
       );
@@ -82,7 +93,11 @@ class AppleSubscriptionService {
         // Keep the generic user-facing message if the response is not JSON.
       }
       debugPrint('Apple purchase verification failed: ${response.statusCode}');
+      debugPrint('[IAP-Sub][verify] rejected http=${response.statusCode} '
+          'elapsedMs=${stopwatch.elapsedMilliseconds}');
       throw StateError(message);
     }
+    debugPrint('[IAP-Sub][verify] accepted http=${response.statusCode} '
+        'elapsedMs=${stopwatch.elapsedMilliseconds}');
   }
 }
