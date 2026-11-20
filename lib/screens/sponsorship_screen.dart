@@ -130,6 +130,11 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
           _durationMonths = availableDurations.first;
         }
       });
+      // Now that the catalog is populated, flush any orphaned StoreKit
+      // transactions (e.g. from a previous failed purchase). The existing
+      // _purchaseUpdates listener will silently complete them so that
+      // future buyNonConsumable calls don't get "already in use".
+      _store.restorePurchases().catchError((_) {});
     } catch (error) {
       if (mounted) {
         setState(() => _applePurchaseError =
@@ -286,20 +291,6 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
       if (mounted) setState(() => _applePurchasePending = false);
       throw Exception('The App Store purchase did not start. Try again.');
     }
-  }
-
-  /// Drain any unfinished StoreKit transactions before initiating a purchase.
-  /// Apple silently returns false from buyNonConsumable when there is an
-  /// unfinished (pending-complete) transaction for the same product in the queue.
-  /// We call restorePurchases() to flush orphaned queue entries; the existing
-  /// _purchaseUpdates listener will complete them as they arrive. We wait
-  /// briefly for the stream to settle before the actual purchase call.
-  Future<void> _drainSponsorshipQueue() async {
-    try {
-      await _store.restorePurchases();
-    } catch (_) {}
-    // Give StoreKit 2 seconds to deliver and complete any pending events.
-    await Future<void>.delayed(const Duration(seconds: 2));
   }
 
   Future<void> _cancelPendingReservation(String docId, String? appleProductId) async {

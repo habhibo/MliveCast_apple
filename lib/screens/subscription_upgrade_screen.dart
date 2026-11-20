@@ -79,6 +79,11 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
         },
       );
       _loadAppleProducts();
+      // Flush any orphaned StoreKit transactions left from previous sessions.
+      // The existing listener will silently complete them (restored events are
+      // ignored when _isRestoringPurchases == false). This clears the queue
+      // so the payment sheet can appear on the next purchase attempt.
+      _store.restorePurchases().catchError((_) {});
     }
     _loadData();
   }
@@ -120,6 +125,13 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
     bool hasCompletedPurchases = false;
 
     for (final purchase in purchases) {
+      // Diagnostic log — visible in Xcode console / device logs
+      debugPrint('[IAP-Sub] stream event: productID=${purchase.productID} '
+          'status=${purchase.status.name} '
+          'purchaseID=${purchase.purchaseID} '
+          'pendingComplete=${purchase.pendingCompletePurchase} '
+          'requested=${_requestedProductIds.contains(purchase.productID)}');
+
       // 1. Only process subscriptions configured for this screen
       if (!AppleSubscriptionService.productToPlan.containsKey(purchase.productID)) {
         continue;
@@ -262,8 +274,22 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
         .toList();
     final productId = productIds.isEmpty ? null : productIds.first;
     final product = productId == null ? null : _storeProducts[productId];
+
+    // ── Diagnostic: always visible so we know exactly what's happening ──
+    debugPrint('[IAP-Sub] plan=${plan.id} productId=$productId '
+        'storeAvailable=$_storeAvailable '
+        'productFound=${product != null} '
+        'storeError=$_storeError '
+        'storeProductsCount=${_storeProducts.length}');
+
     if (!_storeAvailable || productId == null || product == null) {
-      _showMessage(_storeError ?? 'This subscription is not available in the App Store yet.');
+      final reason = !_storeAvailable
+          ? 'App Store not available'
+          : productId == null
+              ? 'No product ID mapped for plan ${plan.id}'
+              : 'Product $productId not returned by App Store Connect';
+      _showMessage('Cannot start purchase: $reason. '
+          '(${_storeError ?? "no store error"})');
       return;
     }
     _requestedProductIds.add(productId);
@@ -271,6 +297,7 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
       _processingPlanId = plan.id;
       _isProcessing = true;
     });
+    _showMessage('Contacting App Store for $productId…');
     _purchaseTimeout?.cancel();
     _purchaseTimeout = Timer(const Duration(seconds: 30), () {
       if (mounted && _isProcessing) {
@@ -278,12 +305,14 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
           _processingPlanId = null;
           _isProcessing = false;
         });
+        _showMessage('Purchase timed out — Apple did not respond for $productId.');
       }
     });
     try {
       final started = await _store.buyNonConsumable(
         purchaseParam: PurchaseParam(productDetails: product),
       );
+      debugPrint('[IAP-Sub] buyNonConsumable returned: $started for $productId');
       if (!started) {
         _purchaseTimeout?.cancel();
         _requestedProductIds.remove(productId);
@@ -292,18 +321,22 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
             _processingPlanId = null;
             _isProcessing = false;
           });
-          _showMessage('Could not start the App Store purchase. Please try again.');
+          _showMessage('Apple returned false for $productId — '
+              'possible Screen Time restriction or existing subscription. '
+              'Check Settings → Screen Time → Content & Privacy Restrictions.');
         }
       }
     } catch (error) {
       _purchaseTimeout?.cancel();
       _requestedProductIds.remove(productId);
+      debugPrint('[IAP-Sub] buyNonConsumable exception: $error');
       if (mounted) {
         setState(() {
           _processingPlanId = null;
           _isProcessing = false;
         });
-        _showMessage('Could not start the App Store purchase: ${error.toString().replaceFirst('Bad state: ', '')}');
+        _showMessage('Purchase error for $productId: '
+            '${error.toString().replaceFirst('Bad state: ', '')}');
       }
     }
   }
