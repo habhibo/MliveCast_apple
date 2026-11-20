@@ -32,11 +32,12 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
   final Set<String> _handledPurchaseUpdates = {};
   final Set<String> _requestedProductIds = {};
   final Map<String, String> _requestedAttemptIds = {};
+  final Map<String, int> _requestedPurchaseAtMillis = {};
+  final Map<String, Completer<void>> _pendingAppleVerifications = {};
   String? _activeAppleAttemptId;
   Timer? _restoreRequestWindow;
   Timer? _purchaseTimeout;
   bool _isRestoringPurchases = false;
-  bool _isDrainingApplePurchaseQueue = false;
   String? _processingPlanId;
 
   String _cleanPrice(String rawPrice) {
@@ -57,6 +58,7 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
 
   List<SubscriptionPlan> _plans = [];
   UserSubscription? _currentSubscription;
+  String? _locallyVerifiedApplePlanId;
   // Canonical subscription level from the users doc — used as fallback when
   // user_subscriptions record is missing, stale, or has an expired endDate.
   String? _canonicalLevel;
@@ -152,7 +154,7 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
 
     for (final purchase in purchases) {
       final eventAttempt = _requestedAttemptIds[purchase.productID] ??
-          _activeAppleAttemptId ?? 'background';
+          (_isRestoringPurchases ? 'restore' : 'background');
       _iapLog(eventAttempt, 'purchaseStream event productID=${purchase.productID} '
           'status=${purchase.status.name} '
           'transactionSuffix=${_purchaseIdSuffix(purchase.purchaseID)} '
@@ -184,6 +186,7 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
       if (purchase.status == PurchaseStatus.canceled || purchase.status == PurchaseStatus.error) {
         final wasRequested = _requestedProductIds.remove(purchase.productID);
         _requestedAttemptIds.remove(purchase.productID);
+        _requestedPurchaseAtMillis.remove(purchase.productID);
         if (wasRequested || _isRestoringPurchases) {
           _purchaseTimeout?.cancel();
         }
@@ -193,7 +196,7 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
           } catch (e) {
           }
         }
-        if (mounted) {
+        if (mounted && (wasRequested || _isRestoringPurchases)) {
           setState(() {
             _processingPlanId = null;
             _isProcessing = false;
@@ -209,34 +212,16 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
 
       if (purchase.status == PurchaseStatus.purchased ||
           purchase.status == PurchaseStatus.restored) {
-        if (purchase.status == PurchaseStatus.restored &&
-            !_isRestoringPurchases &&
-            _isDrainingApplePurchaseQueue) {
-          if (purchase.pendingCompletePurchase) {
-            try {
-              await _store.completePurchase(purchase);
-            } catch (_) {}
-          }
-          continue;
-        }
         final wasRequested = _requestedProductIds.remove(purchase.productID);
         _requestedAttemptIds.remove(purchase.productID);
+        final purchaseRequestedAtMillis =
+            _requestedPurchaseAtMillis.remove(purchase.productID);
         final isRestore = _isRestoringPurchases;
         if (wasRequested || isRestore) {
           // Apple's transaction arrived. Do not let the purchase-start timer
           // expire while the backend verifies it.
           _purchaseTimeout?.cancel();
         }
-        if (purchase.status == PurchaseStatus.restored &&
-            !_isRestoringPurchases &&
-            !wasRequested) {
-          _iapLog(eventAttempt, 'restored transaction ignored outside explicit Restore flow');
-          if (purchase.pendingCompletePurchase) {
-            await _store.completePurchase(purchase);
-          }
-          continue;
-        }
-
         if (!_handledPurchaseUpdates.add(transactionKey)) {
           _iapLog(eventAttempt, 'duplicate transaction update ignored key=$transactionKey');
           if (purchase.pendingCompletePurchase) {
@@ -248,6 +233,8 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
           continue;
         }
 
+        final verificationFinished = Completer<void>();
+        _pendingAppleVerifications[purchase.productID] = verificationFinished;
         var backendSuccess = false;
         Object? backendVerificationError;
         try {
@@ -255,33 +242,64 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
           await _appleSubscriptions.verifyAndActivate(
             purchase.verificationData.serverVerificationData,
             clientAttemptId: eventAttempt,
+            purchaseRequestedAtMillis:
+                wasRequested ? purchaseRequestedAtMillis : null,
           );
           backendSuccess = true;
+          final verifiedPlanId =
+              AppleSubscriptionService.productToPlan[purchase.productID] ??
+                  'premium';
+          _locallyVerifiedApplePlanId = verifiedPlanId;
+          if (mounted) {
+            setState(() {
+              _canonicalLevel = 'premium';
+              _currentSubscription = UserSubscription(
+                userId: FirebaseAuth.instance.currentUser?.uid ?? '',
+                planId: verifiedPlanId,
+                status: 'active',
+                startDate: DateTime.now(),
+                autoRenew: true,
+              );
+            });
+          }
           _iapLog(eventAttempt, 'backend verify succeeded');
         } catch (error) {
           _iapLog(eventAttempt, 'backend verify failed error=$error');
           backendVerificationError = error;
+        } finally {
+          if (identical(
+            _pendingAppleVerifications[purchase.productID],
+            verificationFinished,
+          )) {
+            _pendingAppleVerifications.remove(purchase.productID);
+          }
+          verificationFinished.complete();
         }
 
+        if (backendSuccess) hasCompletedPurchases = true;
         try {
           if (purchase.pendingCompletePurchase) {
-            await _store.completePurchase(purchase);
+            await _store
+                .completePurchase(purchase)
+                .timeout(const Duration(seconds: 5));
             _iapLog(eventAttempt, 'completePurchase succeeded');
-          }
-          hasCompletedPurchases = true;
-          if (mounted && (wasRequested || isRestore)) {
-            final notificationKey = transactionKey;
-            if (_purchaseNotificationsShown.add(notificationKey)) {
-              _showMessage(backendSuccess
-                  ? (isRestore
-                      ? 'Your App Store subscription was restored.'
-                      : 'Your App Store subscription is active.')
-                  : 'Apple returned the purchase, but verification failed: ${backendVerificationError.toString().replaceFirst('Bad state: ', '').replaceFirst('Exception: ', '')}. Your plan has not changed yet.');
-            }
           }
         } catch (e) {
           _iapLog(eventAttempt, 'completePurchase failed error=$e');
-        } finally {
+        }
+        if (mounted && (wasRequested || isRestore)) {
+          final notificationKey = transactionKey;
+          if (_purchaseNotificationsShown.add(notificationKey)) {
+            _showMessage(backendSuccess
+                ? (isRestore
+                    ? 'Your App Store subscription was restored.'
+                    : 'Your App Store subscription is active.')
+                : 'Apple returned the purchase, but verification failed: ${backendVerificationError.toString().replaceFirst('Bad state: ', '').replaceFirst('Exception: ', '')}. Your plan has not changed yet.');
+          }
+        }
+        // The entitlement is already verified and applied on the server.
+        // StoreKit queue cleanup must not hold the subscription screen open.
+        if (wasRequested || isRestore) {
           _purchaseTimeout?.cancel();
           _restoreRequestWindow?.cancel();
           if (mounted) {
@@ -328,20 +346,14 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
           '(${_storeError ?? "no store error"})');
       return;
     }
-    _requestedProductIds.add(productId);
-    _requestedAttemptIds[productId] = attemptId;
     setState(() {
       _processingPlanId = plan.id;
       _isProcessing = true;
     });
     // Step 1: drain any stuck StoreKit transactions.
-    // If there is an unfinished transaction for this product in the queue,
-    // StoreKit queues the new payment but never shows the payment sheet.
-    // restorePurchases() replays all queue entries → our existing listener
-    // calls completePurchase on each one → queue is clean after the wait.
+    // Do this before marking a new purchase as requested. StoreKit may replay
+    // an existing active subscription here; the listener verifies it silently.
     _iapLog(attemptId, 'pre-purchase restorePurchases begin');
-    _showMessage('Clearing Apple queue…');
-    _isDrainingApplePurchaseQueue = true;
     try {
       await _store.restorePurchases();
       _iapLog(attemptId, 'restorePurchases future returned elapsedMs=${attemptTimer.elapsedMilliseconds}');
@@ -350,15 +362,30 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
     }
     // Give StoreKit 3 s to deliver and complete all pending events.
     await Future<void>.delayed(const Duration(seconds: 3));
-    _isDrainingApplePurchaseQueue = false;
+    final restoreVerification = _pendingAppleVerifications[productId];
+    if (restoreVerification != null) {
+      try {
+        await restoreVerification.future.timeout(const Duration(seconds: 30));
+      } catch (_) {
+        // The verification flow reports its own outcome and timeout.
+      }
+    }
     _iapLog(attemptId, 'queue-drain wait ended elapsedMs=${attemptTimer.elapsedMilliseconds}');
     if (!mounted) {
-      _requestedProductIds.remove(productId);
-      _requestedAttemptIds.remove(productId);
       return;
     }
+    if (_locallyVerifiedApplePlanId == plan.id) {
+      setState(() {
+        _processingPlanId = null;
+        _isProcessing = false;
+      });
+      _showMessage('Your App Store subscription is already active.');
+      return;
+    }
+    _requestedProductIds.add(productId);
+    _requestedAttemptIds[productId] = attemptId;
+    _requestedPurchaseAtMillis[productId] = DateTime.now().millisecondsSinceEpoch;
     // Step 2: attempt the actual purchase on a clean queue.
-    _showMessage('Contacting App Store for $productId…');
     _purchaseTimeout?.cancel();
     _purchaseTimeout = Timer(const Duration(seconds: 30), () {
       if (mounted && _isProcessing) {
@@ -385,6 +412,7 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
         _purchaseTimeout?.cancel();
         _requestedProductIds.remove(productId);
         _requestedAttemptIds.remove(productId);
+        _requestedPurchaseAtMillis.remove(productId);
         if (mounted) {
           setState(() {
             _processingPlanId = null;
@@ -399,6 +427,7 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
       _purchaseTimeout?.cancel();
       _requestedProductIds.remove(productId);
       _requestedAttemptIds.remove(productId);
+      _requestedPurchaseAtMillis.remove(productId);
       _iapLog(attemptId, 'buyNonConsumable future threw elapsedMs=${attemptTimer.elapsedMilliseconds} error=$error');
       if (mounted) {
         setState(() {
@@ -489,8 +518,20 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
       if (mounted) {
         setState(() {
           _plans = plans;
-          _currentSubscription = subscription;
-          _canonicalLevel = canonicalLevel;
+          final locallyVerifiedPlanId = _locallyVerifiedApplePlanId;
+          if (locallyVerifiedPlanId != null) {
+            _currentSubscription = UserSubscription(
+              userId: user.uid,
+              planId: locallyVerifiedPlanId,
+              status: 'active',
+              startDate: DateTime.now(),
+              autoRenew: true,
+            );
+            _canonicalLevel = 'premium';
+          } else {
+            _currentSubscription = subscription;
+            _canonicalLevel = canonicalLevel;
+          }
           _isLoading = false;
         });
       }
