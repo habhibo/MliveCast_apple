@@ -4,7 +4,6 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_storage/firebase_storage.dart';
-import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
 
@@ -79,21 +78,11 @@ class SponsorshipService {
   }
 
   Future<Map<String, dynamic>> call(String action, [Map<String, dynamic> data = const {}]) async {
-    final isAppleCall = action.startsWith('start_apple_') ||
-        action.startsWith('cancel_apple_') ||
-        action == 'get_apple_sponsorship_products';
-    final stopwatch = Stopwatch()..start();
     final user = _auth.currentUser;
     if (user == null) throw Exception('Sign in to manage sponsorships.');
     final token = await user.getIdToken();
     if (token == null || token.isEmpty) throw Exception('Could not authenticate this request.');
     final projectId = Firebase.app().options.projectId;
-    if (isAppleCall) {
-      debugPrint('[IAP-Sponsor][API] start action=$action project=$projectId '
-          'clientAttemptId=${data['clientAttemptId'] ?? 'n/a'} '
-          'productId=${data['productId'] ?? 'n/a'} '
-          'tierId=${data['tierId'] ?? 'n/a'}');
-    }
     final response = await http
         .post(
           Uri.parse('https://us-central1-$projectId.cloudfunctions.net/sponsorshipApi'),
@@ -119,16 +108,7 @@ class SponsorshipService {
       );
     }
     if (response.statusCode != 200) {
-      if (isAppleCall) {
-        debugPrint('[IAP-Sponsor][API] failed action=$action '
-            'http=${response.statusCode} elapsedMs=${stopwatch.elapsedMilliseconds} '
-            'error=${body['error'] ?? 'unspecified'}');
-      }
       throw Exception(body['error'] as String? ?? 'Sponsorship request failed.');
-    }
-    if (isAppleCall) {
-      debugPrint('[IAP-Sponsor][API] success action=$action '
-          'http=${response.statusCode} elapsedMs=${stopwatch.elapsedMilliseconds}');
     }
     return body;
   }
@@ -187,11 +167,6 @@ class SponsorshipService {
       throw Exception('Could not authenticate this purchase.');
     }
     final projectId = Firebase.app().options.projectId;
-    final stopwatch = Stopwatch()..start();
-    debugPrint('[IAP-Sponsor][verify] start project=$projectId '
-        'signedDataPresent=${signedTransaction.isNotEmpty} '
-        'signedDataLength=${signedTransaction.length} '
-        'clientAttemptId=$clientAttemptId');
     final response = await http
         .post(
           Uri.parse(
@@ -223,8 +198,6 @@ class SponsorshipService {
     if (response.statusCode < 200 || response.statusCode >= 300) {
       final message =
           body['error'] as String? ?? 'Could not verify this Apple purchase.';
-      debugPrint('[IAP-Sponsor][verify] rejected http=${response.statusCode} '
-          'elapsedMs=${stopwatch.elapsedMilliseconds} error=$message');
       if (response.statusCode == 409) {
         throw AppleSponsorshipReplayException(message);
       }
@@ -233,8 +206,6 @@ class SponsorshipService {
       }
       throw Exception(message);
     }
-    debugPrint('[IAP-Sponsor][verify] accepted http=${response.statusCode} '
-        'elapsedMs=${stopwatch.elapsedMilliseconds}');
   }
 
   Future<String> startPayoutSetup() async {
