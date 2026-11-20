@@ -19,8 +19,27 @@ workflows:
             ios/Runner/GoogleService-Info.plist
           PROJECT_ID=$(/usr/libexec/PlistBuddy -c 'Print :PROJECT_ID' \
             ios/Runner/GoogleService-Info.plist)
+          GOOGLE_REVERSED_CLIENT_ID=$(/usr/libexec/PlistBuddy \
+            -c 'Print :REVERSED_CLIENT_ID' \
+            ios/Runner/GoogleService-Info.plist)
+          GOOGLE_CLIENT_ID=$(/usr/libexec/PlistBuddy \
+            -c 'Print :CLIENT_ID' \
+            ios/Runner/GoogleService-Info.plist)
           if [ "$PROJECT_ID" != "mlivecast-staging" ]; then
             echo "Staging build selected unexpected Firebase project: $PROJECT_ID"
+            exit 1
+          fi
+          /usr/libexec/PlistBuddy \
+            -c "Set :CFBundleURLTypes:0:CFBundleURLSchemes:0 $GOOGLE_REVERSED_CLIENT_ID" \
+            ios/Runner/Info.plist
+          /usr/libexec/PlistBuddy \
+            -c "Set :GIDClientID $GOOGLE_CLIENT_ID" \
+            ios/Runner/Info.plist
+          CONFIGURED_REVERSED_CLIENT_ID=$(/usr/libexec/PlistBuddy \
+            -c 'Print :CFBundleURLTypes:0:CFBundleURLSchemes:0' \
+            ios/Runner/Info.plist)
+          if [ "$CONFIGURED_REVERSED_CLIENT_ID" != "$GOOGLE_REVERSED_CLIENT_ID" ]; then
+            echo "Staging Google Sign-In URL scheme does not match Firebase configuration."
             exit 1
           fi
       - name: Build iOS release (Staging)
@@ -86,6 +105,23 @@ workflows:
             "$APP_PLIST")
           if [ "$IPA_PROJECT_ID" != "mlivecast-staging" ]; then
             echo "Expected staging Firebase in IPA; found $IPA_PROJECT_ID."
+            exit 1
+          fi
+          IPA_REVERSED_CLIENT_ID=$(/usr/libexec/PlistBuddy \
+            -c 'Print :REVERSED_CLIENT_ID' "$APP_PLIST")
+          IPA_GOOGLE_CLIENT_ID=$(/usr/libexec/PlistBuddy \
+            -c 'Print :CLIENT_ID' "$APP_PLIST")
+          IPA_GOOGLE_CONFIGURED_CLIENT_ID=$(/usr/libexec/PlistBuddy \
+            -c 'Print :GIDClientID' "$APP_BUNDLE/Info.plist")
+          IPA_GOOGLE_URL_SCHEME=$(/usr/libexec/PlistBuddy \
+            -c 'Print :CFBundleURLTypes:0:CFBundleURLSchemes:0' \
+            "$APP_BUNDLE/Info.plist")
+          if [ "$IPA_GOOGLE_URL_SCHEME" != "$IPA_REVERSED_CLIENT_ID" ]; then
+            echo "Google Sign-In URL scheme in IPA does not match its Firebase client ID."
+            exit 1
+          fi
+          if [ "$IPA_GOOGLE_CONFIGURED_CLIENT_ID" != "$IPA_GOOGLE_CLIENT_ID" ]; then
+            echo "Google Sign-In client ID in IPA does not match Firebase configuration."
             exit 1
           fi
           ACTUAL_BUILD_NUMBER="$(/usr/libexec/PlistBuddy -c \

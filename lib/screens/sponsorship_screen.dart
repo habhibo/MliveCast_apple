@@ -42,6 +42,7 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
   int _durationMonths = 1;
   String? _busyKey;
   bool _applePurchasePending = false;
+  bool _isLoadingAppleCatalog = false;
   String? _applePurchaseError;
 
   bool get _isIos => !kIsWeb && defaultTargetPlatform == TargetPlatform.iOS;
@@ -70,8 +71,7 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
   }
 
   void _appleLog(String message) {
-    debugPrint('[IAP-Sponsor][${_activeAppleAttemptId ?? 'background'}] '
-        '${DateTime.now().toIso8601String()} $message');
+    // Temporary purchase diagnostics were removed after investigation.
   }
 
   String _purchaseIdSuffix(String? value) {
@@ -83,6 +83,7 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
   void initState() {
     super.initState();
     if (_isIos) {
+      _isLoadingAppleCatalog = true;
       _purchaseUpdates = _store.purchaseStream.listen(
         _handleApplePurchases,
         onError: (Object error) {
@@ -105,6 +106,7 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
 
   Future<void> _loadAppleSponsorshipProducts() async {
     final stopwatch = Stopwatch()..start();
+    if (mounted) setState(() => _isLoadingAppleCatalog = true);
     try {
       _appleLog('catalog load started');
       final available = await _store.isAvailable();
@@ -166,6 +168,8 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
         setState(() => _applePurchaseError =
             error.toString().replaceFirst('Bad state: ', ''));
       }
+    } finally {
+      if (mounted) setState(() => _isLoadingAppleCatalog = false);
     }
   }
 
@@ -362,7 +366,6 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
       _appleLog('buyNonConsumable future returned started=$started elapsedMs=${attemptTimer.elapsedMilliseconds}');
     } catch (e) {
       _appleLog('buyNonConsumable future threw elapsedMs=${attemptTimer.elapsedMilliseconds} error=$e');
-      debugPrint('StoreKit buyNonConsumable failed: $e');
       started = false;
     }
     if (!started) {
@@ -437,7 +440,6 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
       _appleLog('Pay now buyNonConsumable future returned started=$started elapsedMs=${attemptTimer.elapsedMilliseconds}');
     } catch (e) {
       _appleLog('Pay now buyNonConsumable future threw error=$e');
-      debugPrint('StoreKit buyNonConsumable (resume) failed: $e');
       started = false;
     }
     if (!started) {
@@ -662,12 +664,30 @@ class _SponsorshipScreenState extends State<SponsorshipScreen> {
           return true;
         }).toList() ?? [];
         docs.sort((a, b) => (a.data()['price'] as num? ?? 0).compareTo(b.data()['price'] as num? ?? 0));
+        final isLoading = snapshot.connectionState == ConnectionState.waiting ||
+            (_requiresAppleIap && _isLoadingAppleCatalog);
         return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           const _SectionHeading('AVAILABLE TIERS'),
+          if (isLoading)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 18),
+              child: Center(
+                child: Column(mainAxisSize: MainAxisSize.min, children: [
+                  SizedBox(
+                    width: 22,
+                    height: 22,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+                  SizedBox(height: 10),
+                  Text('Loading sponsor plans…'),
+                ]),
+              ),
+            ),
           if (_requiresAppleIap && _applePurchaseError != null)
             _EmptyMessage(_applePurchaseError!),
           if (snapshot.hasError) const _EmptyMessage('Could not load sponsor tiers.'),
-          if (docs.isEmpty && !snapshot.hasError)
+          if (!isLoading && docs.isEmpty && !snapshot.hasError &&
+              _applePurchaseError == null)
             _EmptyMessage(_requiresAppleIap
                 ? 'No sponsor tiers have a matching Apple price option yet.'
                 : 'No sponsor tiers are available yet.'),
