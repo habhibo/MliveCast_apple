@@ -184,6 +184,9 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
       if (purchase.status == PurchaseStatus.canceled || purchase.status == PurchaseStatus.error) {
         final wasRequested = _requestedProductIds.remove(purchase.productID);
         _requestedAttemptIds.remove(purchase.productID);
+        if (wasRequested || _isRestoringPurchases) {
+          _purchaseTimeout?.cancel();
+        }
         if (purchase.pendingCompletePurchase) {
           try {
             await _store.completePurchase(purchase);
@@ -219,6 +222,11 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
         final wasRequested = _requestedProductIds.remove(purchase.productID);
         _requestedAttemptIds.remove(purchase.productID);
         final isRestore = _isRestoringPurchases;
+        if (wasRequested || isRestore) {
+          // Apple's transaction arrived. Do not let the purchase-start timer
+          // expire while the backend verifies it.
+          _purchaseTimeout?.cancel();
+        }
         if (purchase.status == PurchaseStatus.restored &&
             !_isRestoringPurchases &&
             !wasRequested) {
@@ -361,7 +369,10 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
           _processingPlanId = null;
           _isProcessing = false;
         });
-        _showMessage('Purchase timed out — Apple did not respond for $productId.');
+        _showMessage(
+          'Apple has not sent a purchase update yet for $productId. '
+          'If Apple confirmed the purchase, tap Restore Purchases before trying again.',
+        );
       }
     });
     try {

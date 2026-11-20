@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:firebase_auth/firebase_auth.dart';
@@ -48,21 +49,31 @@ class AppleSubscriptionService {
     if (token == null || token.isEmpty) {
       throw StateError('Could not authenticate with Firebase. Sign in again and retry.');
     }
-    final response = await http.post(
-      Uri.parse(
-        'https://us-central1-$projectId.cloudfunctions.net/verifyAppleSubscription',
-      ),
-      headers: {
-        'Authorization': 'Bearer $token',
-        'Content-Type': 'application/json',
-      },
-      body: jsonEncode({
-        'signedTransaction': signedTransaction,
-        if (clientAttemptId != null) 'clientAttemptId': clientAttemptId,
-        if (purchaseRequestedAtMillis != null)
-          'purchaseRequestedAtMillis': purchaseRequestedAtMillis,
-      }),
-    );
+    late http.Response response;
+    try {
+      response = await http
+          .post(
+            Uri.parse(
+              'https://us-central1-$projectId.cloudfunctions.net/verifyAppleSubscription',
+            ),
+            headers: {
+              'Authorization': 'Bearer $token',
+              'Content-Type': 'application/json',
+            },
+            body: jsonEncode({
+              'signedTransaction': signedTransaction,
+              if (clientAttemptId != null) 'clientAttemptId': clientAttemptId,
+              if (purchaseRequestedAtMillis != null)
+                'purchaseRequestedAtMillis': purchaseRequestedAtMillis,
+            }),
+          )
+          .timeout(const Duration(seconds: 25));
+    } on TimeoutException {
+      throw StateError(
+        'Apple completed the purchase, but subscription verification timed '
+        'out. Tap Restore Purchases to sync your plan before trying again.',
+      );
+    }
 
     if (response.statusCode == 409) {
       throw const AppleSubscriptionStaleTransactionException(
