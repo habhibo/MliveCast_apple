@@ -71,6 +71,19 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
   bool get _usesAppleIap =>
       !kIsWeb && defaultTargetPlatform == TargetPlatform.iOS;
 
+  bool get _hasActiveAppleSubscription =>
+      _usesAppleIap &&
+      ((_currentSubscription != null &&
+              _currentSubscription!.isActive &&
+              !_currentSubscription!.isExpired &&
+              _currentSubscription!.stripeSubscriptionId == null &&
+              (_currentSubscription!.planId == 'premium' ||
+                  _currentSubscription!.planId == 'premium_yearly')) ||
+          (_currentSubscription == null &&
+              _canonicalLevel != null &&
+              _canonicalLevel != 'free' &&
+              _canonicalLevel!.isNotEmpty));
+
   void _iapLog(String attemptId, String message) {
     // Temporary purchase diagnostics were removed after investigation.
   }
@@ -493,22 +506,34 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
   }
 
   Future<void> _manageAppleSubscriptions() async {
-    final uri = Uri.parse('https://apps.apple.com/account/subscriptions');
-    if (!await launchUrl(uri, mode: LaunchMode.externalApplication) && mounted) {
-      _showMessage('Could not open Apple subscription settings.');
-    }
-  }
-
-  Future<void> _changeApplePlan(SubscriptionPlan plan) async {
+    final before = _currentSubscription;
     try {
       await _store
           .getPlatformAddition<InAppPurchaseStoreKitPlatformAddition>()
           .showManageSubscriptions();
-      if (mounted) {
+      if (!mounted) return;
+
+      // Renewal preference changes arrive through Apple's server notification.
+      // Allow it a short window to update Firestore, then refresh this screen.
+      for (var attempt = 0; attempt < 4; attempt++) {
+        await Future<void>.delayed(const Duration(seconds: 1));
+        if (!mounted) return;
+        await _loadData(silent: true);
+        final after = _currentSubscription;
+        final changed = after?.planId != before?.planId ||
+            after?.pendingPlanId != before?.pendingPlanId ||
+            after?.autoRenew != before?.autoRenew;
+        if (changed) break;
+      }
+
+      final refreshed = _currentSubscription;
+      if (refreshed?.pendingPlanId != null) {
         _showMessage(
-          'Apple manages changes to an active subscription. The ${plan.interval} '
-          'option may start at renewal; your current plan stays active until then.',
+          '${_planDisplayName(refreshed!.pendingPlanId!)} is scheduled to '
+          'start at renewal. Your current plan stays active until then.',
         );
+      } else if (refreshed != null && refreshed.planId != before?.planId) {
+        _showMessage('${_planDisplayName(refreshed.planId)} is now active.');
       }
     } catch (_) {
       if (mounted) {
@@ -562,7 +587,7 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
         setState(() {
           _plans = plans;
           final locallyVerifiedPlanId = _locallyVerifiedApplePlanId;
-          if (locallyVerifiedPlanId != null) {
+          if (locallyVerifiedPlanId != null && subscription == null) {
             _currentSubscription = UserSubscription(
               userId: user.uid,
               planId: locallyVerifiedPlanId,
@@ -574,6 +599,11 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
           } else {
             _currentSubscription = subscription;
             _canonicalLevel = canonicalLevel;
+            if (subscription != null &&
+                (subscription.planId == locallyVerifiedPlanId ||
+                    subscription.pendingPlanId == locallyVerifiedPlanId)) {
+              _locallyVerifiedApplePlanId = null;
+            }
           }
           _isLoading = false;
         });
@@ -653,14 +683,15 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
                                   )
                                 : const Text('Restore Purchases', style: TextStyle(fontSize: 13)),
                           ),
-                          TextButton(
-                            onPressed: _isProcessing ? null : _manageAppleSubscriptions,
-                            style: TextButton.styleFrom(
-                              foregroundColor: Colors.white70,
-                              disabledForegroundColor: Colors.white30,
+                          if (_hasActiveAppleSubscription)
+                            TextButton(
+                              onPressed: _isProcessing ? null : _manageAppleSubscriptions,
+                              style: TextButton.styleFrom(
+                                foregroundColor: Colors.white70,
+                                disabledForegroundColor: Colors.white30,
+                              ),
+                              child: const Text('Manage / Cancel', style: TextStyle(fontSize: 13)),
                             ),
-                            child: const Text('Manage Subscription', style: TextStyle(fontSize: 13)),
-                          ),
                           TextButton(
                             onPressed: () => CommunitySafetyHelper.showEula(context),
                             style: TextButton.styleFrom(
@@ -769,9 +800,18 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
             )
           else if (!hasActiveSub && canonicalIsPremium)
             const Text(
-              'Your subscription is active. Tap "Subscribe with Apple" to renew or confirm.',
+              'Your Premium access is active. Choose a different duration below '
+              'to request a plan change; Apple may schedule it for renewal.',
               style: TextStyle(color: Colors.white60, fontSize: 12),
             ),
+          if (hasActiveSub && _currentSubscription!.pendingPlanId != null) ...[
+            const SizedBox(height: 8),
+            Text(
+              'Scheduled next: ${_planDisplayName(_currentSubscription!.pendingPlanId!)}. '
+              'Your current plan remains active until renewal.',
+              style: const TextStyle(color: Colors.white70, fontSize: 12),
+            ),
+          ],
           if (hasActiveSub && _currentSubscription!.status == 'canceled')
             Container(
               margin: const EdgeInsets.only(top: 8),
@@ -812,6 +852,9 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
                 ? _canonicalLevel
                 : null));
     final isCurrentPlan = activePlanId == plan.id;
+    final isScheduledPlan = hasActiveSub &&
+        _currentSubscription!.pendingPlanId == plan.id &&
+        !isCurrentPlan;
     final currentPlanPrice = activePlanId == null
         ? 0.0
         : _plans.firstWhere(
@@ -865,6 +908,22 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
                     ),
                   ),
                 ),
+              if (isScheduledPlan)
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                  decoration: BoxDecoration(
+                    color: Colors.blue.withOpacity(0.2),
+                    borderRadius: BorderRadius.circular(20),
+                  ),
+                  child: const Text(
+                    'Starts at renewal',
+                    style: TextStyle(
+                      color: Colors.lightBlueAccent,
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
             ],
           ),
           const SizedBox(height: 8),
@@ -907,8 +966,10 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
           const SizedBox(height: 24),
           if (isCurrentPlan || (_usesAppleIap && plan.id == 'free' && !effectiveHasActive))
             _buildCurrentPlanButton()
-          else if (isCurrentPlan)
-            _buildCurrentPlanButton()
+          else if (_usesAppleIap && plan.id == 'free' && effectiveHasActive)
+            _buildAppleFreePlanNotice()
+          else if (isScheduledPlan)
+            _buildCurrentPlanButton(label: 'Scheduled at renewal')
           else
             _buildUpgradeButton(plan, isUpgrade),
         ],
@@ -937,7 +998,7 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
     );
   }
 
-  Widget _buildCurrentPlanButton() {
+  Widget _buildCurrentPlanButton({String label = 'Current Plan'}) {
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.symmetric(vertical: 16),
@@ -945,10 +1006,10 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
         color: Colors.white.withOpacity(0.1),
         borderRadius: BorderRadius.circular(12),
       ),
-      child: const Center(
+      child: Center(
         child: Text(
-          'Current Plan',
-          style: TextStyle(
+          label,
+          style: const TextStyle(
             color: Colors.white54,
             fontSize: 16,
             fontWeight: FontWeight.bold,
@@ -958,29 +1019,41 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
     );
   }
 
+  Widget _buildAppleFreePlanNotice() {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(0.06),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.white.withOpacity(0.1)),
+      ),
+      child: const Text(
+        'To return to Free, cancel your subscription using Manage / Cancel below. '
+        'Premium stays active until the current period ends.',
+        style: TextStyle(color: Colors.white70, fontSize: 13),
+      ),
+    );
+  }
+
+  String _planDisplayName(String planId) {
+    for (final plan in _plans) {
+      if (plan.id == planId) return '${plan.name} ${plan.interval}';
+    }
+    return planId;
+  }
+
   Widget _buildUpgradeButton(SubscriptionPlan plan, bool isUpgrade) {
     final label = isUpgrade ? 'Upgrade' : 'Switch Plan';
     final color = isUpgrade ? AppTheme.primary : Colors.blue;
-    final hasActiveAppleSubscription = _usesAppleIap &&
-        _currentSubscription != null &&
-        _currentSubscription!.isActive &&
-        !_currentSubscription!.isExpired &&
-        _currentSubscription!.stripeSubscriptionId == null &&
-        (_currentSubscription!.planId == 'premium' ||
-            _currentSubscription!.planId == 'premium_yearly');
     final appleProductReady = !_usesAppleIap ||
-        hasActiveAppleSubscription ||
         (_storeAvailable && _storeProducts.containsKey(_appleProductIdForPlan(plan.id)));
     final isThisPlanProcessing = _isProcessing && _processingPlanId == plan.id;
 
     return InkWell(
       onTap: _isProcessing || !appleProductReady
           ? null
-          : () => _usesAppleIap
-              ? (hasActiveAppleSubscription
-                  ? _changeApplePlan(plan)
-                  : _buyApplePlan(plan))
-              : _showPaymentDialog(plan),
+          : () => _usesAppleIap ? _buyApplePlan(plan) : _showPaymentDialog(plan),
       borderRadius: BorderRadius.circular(12),
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 200),
@@ -1010,8 +1083,8 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
                           ? 'Not available'
                           : 'Loading App Store…')
                       : _usesAppleIap
-                          ? (hasActiveAppleSubscription
-                              ? 'Change with Apple'
+                          ? (_hasActiveAppleSubscription
+                              ? 'Switch to ${plan.interval}'
                               : 'Subscribe with Apple')
                           : label,
                   style: TextStyle(

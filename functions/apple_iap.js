@@ -170,6 +170,8 @@ async function writeAppleEntitlement({
   uid,
   transaction,
   autoRenew,
+  pendingPlanId,
+  pendingAppleProductId,
   statusOverride,
   entitlementEndMs,
   allowAccountTransfer = false,
@@ -238,6 +240,16 @@ async function writeAppleEntitlement({
     const effectiveAutoRenew = autoRenew == null ?
       (sameAppleSubscription ?
         existingSubscription.get("autoRenew") !== false : true) : autoRenew;
+    const pendingPlanFields = {};
+    if (pendingPlanId !== undefined) {
+      pendingPlanFields.pendingPlanId = pendingPlanId;
+      pendingPlanFields.pendingAppleProductId = pendingAppleProductId || null;
+    } else if (existingSubscription.exists &&
+        existingSubscription.get("pendingAppleProductId") ===
+          transaction.productId) {
+      pendingPlanFields.pendingPlanId = null;
+      pendingPlanFields.pendingAppleProductId = null;
+    }
 
     // A transfer is a move, not a second entitlement. Revoke the Apple
     // subscription from each prior Mlivecast account in this verified chain.
@@ -286,6 +298,12 @@ async function writeAppleEntitlement({
     // A delayed event must not overwrite a newer entitlement already applied
     // for the same account.
     if (Number.isFinite(existingEndDate) && existingEndDate > expiresAt) {
+      if (Object.keys(pendingPlanFields).length > 0) {
+        firestoreTransaction.set(subscriptionRef, {
+          ...pendingPlanFields,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        }, {merge: true});
+      }
       if (status === "active") {
         firestoreTransaction.set(
             userRef, {subscriptionLevel: "premium"}, {merge: true});
@@ -306,6 +324,7 @@ async function writeAppleEntitlement({
         appleTransactionId: transaction.transactionId,
         appleOriginalTransactionId: transaction.originalTransactionId,
         appleEnvironment: transaction.environment || null,
+        ...pendingPlanFields,
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       }, {merge: true});
       // Existing feature gates check the canonical "premium" level. The plan
@@ -325,6 +344,7 @@ async function writeAppleEntitlement({
         appleTransactionId: transaction.transactionId,
         appleOriginalTransactionId: transaction.originalTransactionId,
         appleEnvironment: transaction.environment || null,
+        ...pendingPlanFields,
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       }, {merge: true});
       firestoreTransaction.set(
@@ -576,11 +596,28 @@ exports.appleSubscriptionNotifications = functions
         }
         const uid = ownerSnapshot.get("userId");
         let autoRenew;
+        let pendingPlanId;
+        let pendingAppleProductId;
         let entitlementEndMs = Number(transaction.expiresDate);
         if (data.signedRenewalInfo) {
           const renewal = await verifier.verifyAndDecodeRenewalInfo(
               data.signedRenewalInfo);
           autoRenew = Number(renewal.autoRenewStatus) === 1;
+          if (Number(renewal.autoRenewStatus) !== 1) {
+            pendingPlanId = null;
+            pendingAppleProductId = null;
+          } else if (typeof renewal.autoRenewProductId === "string" &&
+              PRODUCT_PLANS[renewal.autoRenewProductId]) {
+            const renewalPlanId = PRODUCT_PLANS[renewal.autoRenewProductId];
+            const currentPlanId = PRODUCT_PLANS[transaction.productId];
+            if (renewalPlanId === currentPlanId) {
+              pendingPlanId = null;
+              pendingAppleProductId = null;
+            } else {
+              pendingPlanId = renewalPlanId;
+              pendingAppleProductId = renewal.autoRenewProductId;
+            }
+          }
           const gracePeriodEnd = Number(renewal.gracePeriodExpiresDate);
           if (Number.isFinite(gracePeriodEnd) &&
               gracePeriodEnd > entitlementEndMs) {
@@ -595,6 +632,8 @@ exports.appleSubscriptionNotifications = functions
           uid,
           transaction,
           autoRenew,
+          pendingPlanId,
+          pendingAppleProductId,
           statusOverride,
           entitlementEndMs,
         });

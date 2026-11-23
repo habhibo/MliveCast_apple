@@ -71,6 +71,7 @@ class UserSubscription {
   final bool autoRenew;
   final String? stripeSubscriptionId;
   final String? stripeCustomerId;
+  final String? pendingPlanId;
 
   UserSubscription({
     required this.userId,
@@ -81,6 +82,7 @@ class UserSubscription {
     required this.autoRenew,
     this.stripeSubscriptionId,
     this.stripeCustomerId,
+    this.pendingPlanId,
   });
 
   Map<String, dynamic> toMap() {
@@ -93,6 +95,7 @@ class UserSubscription {
       'autoRenew': autoRenew,
       'stripeSubscriptionId': stripeSubscriptionId,
       'stripeCustomerId': stripeCustomerId,
+      'pendingPlanId': pendingPlanId,
     };
   }
 
@@ -106,6 +109,7 @@ class UserSubscription {
       autoRenew: map['autoRenew'] as bool,
       stripeSubscriptionId: map['stripeSubscriptionId'] as String?,
       stripeCustomerId: map['stripeCustomerId'] as String?,
+      pendingPlanId: map['pendingPlanId'] as String?,
     );
   }
 
