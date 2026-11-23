@@ -3,7 +3,7 @@ workflows:
     name: iOS Staging Build (TestFlight)
     max_build_duration: 60
     environment:
-      flutter: 3.32.4
+      flutter: 3.35.7
       groups:
         - ios_signing
       ios_signing:
@@ -157,7 +157,7 @@ workflows:
     name: iOS Build (Production)
     max_build_duration: 60
     environment:
-      flutter: 3.32.4
+      flutter: 3.35.7
       groups:
         - ios_signing
       ios_signing:
@@ -196,7 +196,7 @@ workflows:
     name: Android Release Build (.aab)
     max_build_duration: 60
     environment:
-      flutter: 3.32.4
+      flutter: 3.35.7
     scripts:
       - name: Get Flutter dependencies
         script: flutter pub get

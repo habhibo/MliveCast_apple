@@ -200,29 +200,14 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
 
       // StoreKit can replay an old transaction while a new purchase is being
       // requested. Product ID alone cannot distinguish that replay from the
-      // tapped purchase. Only accept restored events during the explicit
-      // Restore Purchases action; otherwise finish the replay and wait for a
-      // genuine purchased event.
+      // tapped purchase. Finish the replay, but leave the purchase attempt
+      // pending for its actual purchased/canceled/error update. The timeout
+      // handles the case where StoreKit never sends that update.
       if (purchase.status == PurchaseStatus.restored && !_isRestoringPurchases) {
-        final wasRequested = _requestedProductIds.remove(purchase.productID);
-        _requestedAttemptIds.remove(purchase.productID);
         if (purchase.pendingCompletePurchase) {
           try {
             await _store.completePurchase(purchase);
           } catch (_) {}
-        }
-        if (wasRequested) {
-          _purchaseTimeout?.cancel();
-          if (mounted) {
-            setState(() {
-              _processingPlanId = null;
-              _isProcessing = false;
-            });
-            _showMessage(
-              'Apple returned an older transaction, not a new purchase. '
-              'No plan change was made. Use Restore Purchases to sync an active subscription.',
-            );
-          }
         }
         continue;
       }
@@ -509,6 +494,19 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
   Future<void> _manageAppleSubscriptions() async {
     final uri = Uri.parse('https://apps.apple.com/account/subscriptions');
     if (!await launchUrl(uri, mode: LaunchMode.externalApplication) && mounted) {
+      _showMessage('Could not open Apple subscription settings.');
+    }
+  }
+
+  Future<void> _changeApplePlan(SubscriptionPlan plan) async {
+    final uri = Uri.parse('https://apps.apple.com/account/subscriptions');
+    final opened = await launchUrl(uri, mode: LaunchMode.externalApplication);
+    if (mounted && opened) {
+      _showMessage(
+        'Apple manages changes to an active subscription. Choose ${plan.name} '
+        'in Apple Subscriptions; a lower-duration plan starts at renewal.',
+      );
+    } else if (mounted) {
       _showMessage('Could not open Apple subscription settings.');
     }
   }
@@ -954,14 +952,26 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
   Widget _buildUpgradeButton(SubscriptionPlan plan, bool isUpgrade) {
     final label = isUpgrade ? 'Upgrade' : 'Switch Plan';
     final color = isUpgrade ? AppTheme.primary : Colors.blue;
+    final hasActiveAppleSubscription = _usesAppleIap &&
+        _currentSubscription != null &&
+        _currentSubscription!.isActive &&
+        !_currentSubscription!.isExpired &&
+        _currentSubscription!.stripeSubscriptionId == null &&
+        (_currentSubscription!.planId == 'premium' ||
+            _currentSubscription!.planId == 'premium_yearly');
     final appleProductReady = !_usesAppleIap ||
+        hasActiveAppleSubscription ||
         (_storeAvailable && _storeProducts.containsKey(_appleProductIdForPlan(plan.id)));
     final isThisPlanProcessing = _isProcessing && _processingPlanId == plan.id;
 
     return InkWell(
       onTap: _isProcessing || !appleProductReady
           ? null
-          : () => _usesAppleIap ? _buyApplePlan(plan) : _showPaymentDialog(plan),
+          : () => _usesAppleIap
+              ? (hasActiveAppleSubscription
+                  ? _changeApplePlan(plan)
+                  : _buyApplePlan(plan))
+              : _showPaymentDialog(plan),
       borderRadius: BorderRadius.circular(12),
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 200),
@@ -990,7 +1000,11 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
                       ? (_storeError != null || _storeAvailable
                           ? 'Not available'
                           : 'Loading App Store…')
-                      : _usesAppleIap ? 'Subscribe with Apple' : label,
+                      : _usesAppleIap
+                          ? (hasActiveAppleSubscription
+                              ? 'Change with Apple'
+                              : 'Subscribe with Apple')
+                          : label,
                   style: TextStyle(
                     color: !appleProductReady ? Colors.white38 : Colors.white,
                     fontSize: 16,
