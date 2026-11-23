@@ -93,16 +93,6 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
         },
       );
       _loadAppleProducts();
-      // Flush any orphaned StoreKit transactions left from previous sessions.
-      // The existing listener will silently complete them (restored events are
-      // ignored when _isRestoringPurchases == false). This clears the queue
-      // so the payment sheet can appear on the next purchase attempt.
-      _iapLog('startup', 'restorePurchases begin');
-      _store.restorePurchases().then((_) {
-        _iapLog('startup', 'restorePurchases future returned');
-      }).catchError((Object error) {
-        _iapLog('startup', 'restorePurchases future failed error=$error');
-      });
     }
     _loadData();
   }
@@ -205,6 +195,35 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
         }
         _iapLog(eventAttempt, 'terminal event handled wasRequested=$wasRequested '
             'completeCalled=${purchase.pendingCompletePurchase}');
+        continue;
+      }
+
+      // StoreKit can replay an old transaction while a new purchase is being
+      // requested. Product ID alone cannot distinguish that replay from the
+      // tapped purchase. Only accept restored events during the explicit
+      // Restore Purchases action; otherwise finish the replay and wait for a
+      // genuine purchased event.
+      if (purchase.status == PurchaseStatus.restored && !_isRestoringPurchases) {
+        final wasRequested = _requestedProductIds.remove(purchase.productID);
+        _requestedAttemptIds.remove(purchase.productID);
+        if (purchase.pendingCompletePurchase) {
+          try {
+            await _store.completePurchase(purchase);
+          } catch (_) {}
+        }
+        if (wasRequested) {
+          _purchaseTimeout?.cancel();
+          if (mounted) {
+            setState(() {
+              _processingPlanId = null;
+              _isProcessing = false;
+            });
+            _showMessage(
+              'Apple returned an older transaction, not a new purchase. '
+              'No plan change was made. Use Restore Purchases to sync an active subscription.',
+            );
+          }
+        }
         continue;
       }
 
