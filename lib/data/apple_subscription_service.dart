@@ -12,14 +12,6 @@ class AppleSubscriptionInactiveException implements Exception {
   String toString() => message;
 }
 
-class AppleSubscriptionStaleTransactionException implements Exception {
-  final String message;
-  const AppleSubscriptionStaleTransactionException(this.message);
-
-  @override
-  String toString() => message;
-}
-
 /// Sends StoreKit's signed transaction to the trusted backend for verification.
 /// Firestore entitlements are written by the backend only after Apple's JWS is
 /// verified; the client never grants premium access from a local callback.
@@ -31,7 +23,6 @@ class AppleSubscriptionService {
 
   Future<void> verifyAndActivate(
     String signedTransaction, {
-    int? purchaseRequestedAtMillis,
     String? clientAttemptId,
   }) async {
     final user = FirebaseAuth.instance.currentUser;
@@ -63,8 +54,6 @@ class AppleSubscriptionService {
             body: jsonEncode({
               'signedTransaction': signedTransaction,
               if (clientAttemptId != null) 'clientAttemptId': clientAttemptId,
-              if (purchaseRequestedAtMillis != null)
-                'purchaseRequestedAtMillis': purchaseRequestedAtMillis,
             }),
           )
           .timeout(const Duration(seconds: 25));
@@ -75,11 +64,6 @@ class AppleSubscriptionService {
       );
     }
 
-    if (response.statusCode == 409) {
-      throw const AppleSubscriptionStaleTransactionException(
-        'Apple returned an older transaction; no new subscription was purchased.',
-      );
-    }
     if (response.statusCode == 402) {
       throw const AppleSubscriptionInactiveException(
         'Apple returned an expired or revoked subscription transaction.',

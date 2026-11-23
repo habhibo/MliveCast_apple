@@ -32,7 +32,6 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
   final Set<String> _handledPurchaseUpdates = {};
   final Set<String> _requestedProductIds = {};
   final Map<String, String> _requestedAttemptIds = {};
-  final Map<String, int> _requestedPurchaseAtMillis = {};
   final Map<String, Completer<void>> _pendingAppleVerifications = {};
   String? _activeAppleAttemptId;
   Timer? _restoreRequestWindow;
@@ -186,7 +185,6 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
       if (purchase.status == PurchaseStatus.canceled || purchase.status == PurchaseStatus.error) {
         final wasRequested = _requestedProductIds.remove(purchase.productID);
         _requestedAttemptIds.remove(purchase.productID);
-        _requestedPurchaseAtMillis.remove(purchase.productID);
         if (wasRequested || _isRestoringPurchases) {
           _purchaseTimeout?.cancel();
         }
@@ -214,8 +212,6 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
           purchase.status == PurchaseStatus.restored) {
         final wasRequested = _requestedProductIds.remove(purchase.productID);
         _requestedAttemptIds.remove(purchase.productID);
-        final purchaseRequestedAtMillis =
-            _requestedPurchaseAtMillis.remove(purchase.productID);
         final isRestore = _isRestoringPurchases;
         if (wasRequested || isRestore) {
           // Apple's transaction arrived. Do not let the purchase-start timer
@@ -224,13 +220,55 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
         }
         if (!_handledPurchaseUpdates.add(transactionKey)) {
           _iapLog(eventAttempt, 'duplicate transaction update ignored key=$transactionKey');
+          // StoreKit can replay the same restored transaction while a user is
+          // tapping a plan. Wait for the first verification to finish, then
+          // treat a verified replay as success instead of leaving the button
+          // disabled or reporting that the plan is still free.
+          final existingVerification =
+              _pendingAppleVerifications[purchase.productID];
+          if (existingVerification != null) {
+            try {
+              await existingVerification.future.timeout(
+                const Duration(seconds: 30),
+              );
+            } catch (_) {
+              // The original verification reports its own result.
+            }
+          }
           if (purchase.pendingCompletePurchase) {
             try {
               await _store.completePurchase(purchase);
             } catch (e) {
             }
           }
-          continue;
+          if (_handledPurchaseUpdates.contains(transactionKey)) {
+            hasCompletedPurchases = true;
+            final verifiedPlanId =
+                AppleSubscriptionService.productToPlan[purchase.productID] ??
+                    'premium';
+            _locallyVerifiedApplePlanId = verifiedPlanId;
+            if (mounted) {
+              setState(() {
+                _canonicalLevel = 'premium';
+                _currentSubscription = UserSubscription(
+                  userId: FirebaseAuth.instance.currentUser?.uid ?? '',
+                  planId: verifiedPlanId,
+                  status: 'active',
+                  startDate: DateTime.now(),
+                  autoRenew: true,
+                );
+                _processingPlanId = null;
+                _isProcessing = false;
+                _isRestoringPurchases = false;
+              });
+            }
+            _purchaseTimeout?.cancel();
+            _restoreRequestWindow?.cancel();
+            continue;
+          }
+          // The earlier verification failed. Permit this StoreKit replay to
+          // retry the backend verification instead of permanently deduping it.
+          _handledPurchaseUpdates.remove(transactionKey);
         }
 
         final verificationFinished = Completer<void>();
@@ -242,10 +280,9 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
           await _appleSubscriptions.verifyAndActivate(
             purchase.verificationData.serverVerificationData,
             clientAttemptId: eventAttempt,
-            purchaseRequestedAtMillis:
-                wasRequested ? purchaseRequestedAtMillis : null,
           );
           backendSuccess = true;
+          _handledPurchaseUpdates.add(transactionKey);
           final verifiedPlanId =
               AppleSubscriptionService.productToPlan[purchase.productID] ??
                   'premium';
@@ -265,6 +302,8 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
           _iapLog(eventAttempt, 'backend verify succeeded');
         } catch (error) {
           _iapLog(eventAttempt, 'backend verify failed error=$error');
+          // A failed verification must remain retryable through Restore.
+          _handledPurchaseUpdates.remove(transactionKey);
           backendVerificationError = error;
         } finally {
           if (identical(
@@ -350,27 +389,6 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
       _processingPlanId = plan.id;
       _isProcessing = true;
     });
-    // Step 1: drain any stuck StoreKit transactions.
-    // Do this before marking a new purchase as requested. StoreKit may replay
-    // an existing active subscription here; the listener verifies it silently.
-    _iapLog(attemptId, 'pre-purchase restorePurchases begin');
-    try {
-      await _store.restorePurchases();
-      _iapLog(attemptId, 'restorePurchases future returned elapsedMs=${attemptTimer.elapsedMilliseconds}');
-    } catch (error) {
-      _iapLog(attemptId, 'restorePurchases future failed elapsedMs=${attemptTimer.elapsedMilliseconds} error=$error');
-    }
-    // Give StoreKit 3 s to deliver and complete all pending events.
-    await Future<void>.delayed(const Duration(seconds: 3));
-    final restoreVerification = _pendingAppleVerifications[productId];
-    if (restoreVerification != null) {
-      try {
-        await restoreVerification.future.timeout(const Duration(seconds: 30));
-      } catch (_) {
-        // The verification flow reports its own outcome and timeout.
-      }
-    }
-    _iapLog(attemptId, 'queue-drain wait ended elapsedMs=${attemptTimer.elapsedMilliseconds}');
     if (!mounted) {
       return;
     }
@@ -384,7 +402,6 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
     }
     _requestedProductIds.add(productId);
     _requestedAttemptIds[productId] = attemptId;
-    _requestedPurchaseAtMillis[productId] = DateTime.now().millisecondsSinceEpoch;
     // Step 2: attempt the actual purchase on a clean queue.
     _purchaseTimeout?.cancel();
     _purchaseTimeout = Timer(const Duration(seconds: 30), () {
@@ -396,6 +413,8 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
           _processingPlanId = null;
           _isProcessing = false;
         });
+        _requestedProductIds.remove(productId);
+        _requestedAttemptIds.remove(productId);
         _showMessage(
           'Apple has not sent a purchase update yet for $productId. '
           'If Apple confirmed the purchase, tap Restore Purchases before trying again.',
@@ -412,7 +431,6 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
         _purchaseTimeout?.cancel();
         _requestedProductIds.remove(productId);
         _requestedAttemptIds.remove(productId);
-        _requestedPurchaseAtMillis.remove(productId);
         if (mounted) {
           setState(() {
             _processingPlanId = null;
@@ -427,7 +445,6 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
       _purchaseTimeout?.cancel();
       _requestedProductIds.remove(productId);
       _requestedAttemptIds.remove(productId);
-      _requestedPurchaseAtMillis.remove(productId);
       _iapLog(attemptId, 'buyNonConsumable future threw elapsedMs=${attemptTimer.elapsedMilliseconds} error=$error');
       if (mounted) {
         setState(() {

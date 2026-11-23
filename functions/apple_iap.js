@@ -289,8 +289,6 @@ exports.verifyAppleSubscription = functions
         console.info("[IAP-Subscription] verification request", JSON.stringify({
           userTag: diagnosticTag(decoded.uid),
           clientAttemptId,
-          purchaseRequestedAtMillis: req.body &&
-            req.body.purchaseRequestedAtMillis || null,
         }));
         const signedTransaction = req.body && req.body.signedTransaction;
         console.info("[IAP-Subscription] request authenticated", JSON.stringify({
@@ -315,25 +313,11 @@ exports.verifyAppleSubscription = functions
           revoked: Boolean(transaction.revocationDate),
           environment: transaction.environment || null,
         }));
-        const purchaseRequestedAtMillis = Number(
-            req.body && req.body.purchaseRequestedAtMillis);
-        if (Number.isFinite(purchaseRequestedAtMillis) &&
-            Number(transaction.purchaseDate) + 5000 <
-              purchaseRequestedAtMillis) {
-          console.warn("[IAP-Subscription] stale transaction rejected", JSON.stringify({
-            userTag: diagnosticTag(decoded.uid),
-            clientAttemptId,
-            productId: transaction.productId,
-            transactionTag: diagnosticTag(transaction.transactionId),
-            transactionSuffix: diagnosticSuffix(transaction.transactionId),
-            purchaseRequestedAtMillis,
-            purchaseDate: transaction.purchaseDate,
-          }));
-          return res.status(409).json({
-            error: "Apple sent an older transaction, not a new subscription purchase.",
-            code: "APPLE_OLD_TRANSACTION",
-          });
-        }
+        // Apple's verified signed transaction is the source of truth. Do not
+        // compare its purchaseDate with the device clock: clock skew and
+        // StoreKit replay/restore can make a valid active entitlement appear
+        // older than the client request. Expiration, revocation, and original
+        // transaction ownership are checked below and in writeAppleEntitlement.
         if (transaction.revocationDate ||
             Number(transaction.expiresDate) <= Date.now()) {
           console.warn("[IAP-Subscription] inactive transaction rejected", JSON.stringify({
