@@ -164,7 +164,7 @@ function asIsoDate(milliseconds) {
 /**
  * Persist a verified Apple transaction and update the user's entitlement.
  * @param {Object} options Verified transaction and entitlement status fields.
- * @return {Promise<void>} Resolves after the Firestore transaction commits.
+ * @return {Promise<Object>} Transfer result after the Firestore transaction commits.
  */
 async function writeAppleEntitlement({
   uid,
@@ -172,6 +172,7 @@ async function writeAppleEntitlement({
   autoRenew,
   statusOverride,
   entitlementEndMs,
+  allowAccountTransfer = false,
 }) {
   const planId = PRODUCT_PLANS[transaction.productId];
   const expiresAt = Number(entitlementEndMs || transaction.expiresDate);
@@ -185,26 +186,82 @@ async function writeAppleEntitlement({
       .doc(transaction.transactionId);
   const subscriptionRef = db.collection("user_subscriptions").doc(uid);
   const userRef = db.collection("users").doc(uid);
+  let transferredFromUids = [];
 
   await db.runTransaction(async (firestoreTransaction) => {
     const owner = await firestoreTransaction.get(ownerRef);
     const existingSubscription = await firestoreTransaction.get(
         subscriptionRef);
     const prior = await firestoreTransaction.get(transactionRef);
-    if (owner.exists && owner.get("userId") !== uid) {
+    const ownerUid = owner.exists ? owner.get("userId") : null;
+    const priorUid = prior.exists ? prior.get("userId") : null;
+    const ownerBelongsToAnotherUser = Boolean(ownerUid && ownerUid !== uid);
+    // The original-transaction owner is authoritative after a transfer. Old
+    // per-transaction rows from that same chain can be reassigned on restore.
+    // If no chain owner exists, a conflicting transaction row still requires
+    // an explicit user restore before it can be claimed.
+    const orphanedTransactionBelongsToAnotherUser = !owner.exists &&
+      Boolean(priorUid && priorUid !== uid);
+    if ((ownerBelongsToAnotherUser || orphanedTransactionBelongsToAnotherUser) &&
+        !allowAccountTransfer) {
       throw new Error(
-          "This App Store subscription is linked to another Mlivecast account");
+          "This Apple subscription is linked to another Mlivecast account. " +
+          "Tap Restore Purchases to move it to this account.");
     }
-    if (prior.exists && prior.get("userId") !== uid) {
-      throw new Error(
-          "This App Store transaction is already linked to another account");
+
+    transferredFromUids = allowAccountTransfer ?
+      [...new Set([
+        ...(ownerBelongsToAnotherUser ? [ownerUid] : []),
+        ...(orphanedTransactionBelongsToAnotherUser ? [priorUid] : []),
+      ])] : [];
+    const previousAccounts = [];
+    for (const previousUid of transferredFromUids) {
+      const previousSubscriptionRef = db.collection("user_subscriptions")
+          .doc(previousUid);
+      const previousUserRef = db.collection("users").doc(previousUid);
+      const [previousSubscription, previousUser] = await Promise.all([
+        firestoreTransaction.get(previousSubscriptionRef),
+        firestoreTransaction.get(previousUserRef),
+      ]);
+      previousAccounts.push({
+        uid: previousUid,
+        subscriptionRef: previousSubscriptionRef,
+        subscription: previousSubscription,
+        userRef: previousUserRef,
+        user: previousUser,
+      });
     }
+
     const sameAppleSubscription = existingSubscription.exists &&
       existingSubscription.get("appleOriginalTransactionId") ===
         transaction.originalTransactionId;
     const effectiveAutoRenew = autoRenew == null ?
       (sameAppleSubscription ?
         existingSubscription.get("autoRenew") !== false : true) : autoRenew;
+
+    // A transfer is a move, not a second entitlement. Revoke the Apple
+    // subscription from each prior Mlivecast account in this verified chain.
+    for (const previous of previousAccounts) {
+      const previousData = previous.subscription.exists ?
+        previous.subscription.data() : null;
+      if (previousData &&
+          previousData.paymentProvider === "apple" &&
+          previousData.appleOriginalTransactionId ===
+            transaction.originalTransactionId) {
+        firestoreTransaction.set(previous.subscriptionRef, {
+          status: "transferred",
+          autoRenew: false,
+          transferredToUserId: uid,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        }, {merge: true});
+        if (previous.user.exists &&
+            previous.user.get("subscriptionLevel") === "premium") {
+          firestoreTransaction.set(previous.userRef,
+              {subscriptionLevel: "free"}, {merge: true});
+        }
+      }
+    }
+
     firestoreTransaction.set(ownerRef, {
       userId: uid,
       originalTransactionId: transaction.originalTransactionId,
@@ -228,7 +285,13 @@ async function writeAppleEntitlement({
       Date.parse(existingSubscription.get("endDate") || "") : 0;
     // A delayed event must not overwrite a newer entitlement already applied
     // for the same account.
-    if (Number.isFinite(existingEndDate) && existingEndDate > expiresAt) return;
+    if (Number.isFinite(existingEndDate) && existingEndDate > expiresAt) {
+      if (status === "active") {
+        firestoreTransaction.set(
+            userRef, {subscriptionLevel: "premium"}, {merge: true});
+      }
+      return;
+    }
 
     if (status === "active") {
       firestoreTransaction.set(subscriptionRef, {
@@ -268,6 +331,10 @@ async function writeAppleEntitlement({
           userRef, {subscriptionLevel: "free"}, {merge: true});
     }
   });
+  return {
+    transferred: transferredFromUids.length > 0,
+    transferredFromUids,
+  };
 }
 
 exports.verifyAppleSubscription = functions
@@ -286,6 +353,8 @@ exports.verifyAppleSubscription = functions
         const decoded = await admin.auth().verifyIdToken(match[1]);
         const clientAttemptId = typeof (req.body && req.body.clientAttemptId) === "string" ?
           req.body.clientAttemptId.slice(0, 80) : null;
+        const userInitiatedSync = clientAttemptId === "restore" ||
+          Boolean(clientAttemptId && clientAttemptId.startsWith("sub-"));
         console.info("[IAP-Subscription] verification request", JSON.stringify({
           userTag: diagnosticTag(decoded.uid),
           clientAttemptId,
@@ -333,7 +402,21 @@ exports.verifyAppleSubscription = functions
             error: "This App Store subscription is no longer active",
           });
         }
-        await writeAppleEntitlement({uid: decoded.uid, transaction});
+        const entitlementResult = await writeAppleEntitlement({
+          uid: decoded.uid,
+          transaction,
+          allowAccountTransfer: userInitiatedSync,
+        });
+        if (entitlementResult.transferred) {
+          console.info("[IAP-Subscription] ownership transferred", JSON.stringify({
+            fromUserTags: entitlementResult.transferredFromUids.map(
+                (previousUid) => diagnosticTag(previousUid)),
+            toUserTag: diagnosticTag(decoded.uid),
+            productId: transaction.productId,
+            originalTransactionTag: diagnosticTag(
+                transaction.originalTransactionId),
+          }));
+        }
         console.info("[IAP-Subscription] entitlement activated", JSON.stringify({
           userTag: diagnosticTag(decoded.uid),
           clientAttemptId,
@@ -341,7 +424,10 @@ exports.verifyAppleSubscription = functions
           transactionTag: diagnosticTag(transaction.transactionId),
           transactionSuffix: diagnosticSuffix(transaction.transactionId),
         }));
-        return res.status(200).json({ok: true});
+        return res.status(200).json({
+          ok: true,
+          transferred: entitlementResult.transferred,
+        });
       } catch (error) {
         console.error("[verifyAppleSubscription]", JSON.stringify({
           clientAttemptId: req.body && req.body.clientAttemptId || null,
