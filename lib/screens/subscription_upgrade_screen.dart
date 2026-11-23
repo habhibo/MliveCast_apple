@@ -776,15 +776,22 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
         _canonicalLevel != 'free' &&
         _canonicalLevel!.isNotEmpty;
     final effectiveHasActive = hasActiveSub || canonicalIsPremium;
+    // `users.subscriptionLevel` is only "premium" for both billing periods.
+    // Use the specific subscription record (or the locally verified product)
+    // to mark a paid tier current; a yearly plan must not mark monthly current.
     final activePlanId = hasActiveSub
         ? _currentSubscription!.planId
-        : (canonicalIsPremium ? (_canonicalLevel ?? 'free') : 'free');
-    final isCurrentPlan = activePlanId == plan.id ||
-        (canonicalIsPremium && plan.id == 'premium' && activePlanId.startsWith('premium'));
-    final currentPlanPrice = _plans.firstWhere(
-      (p) => p.id == activePlanId,
-      orElse: () => _plans[0],
-    ).price;
+        : (_locallyVerifiedApplePlanId ??
+            (canonicalIsPremium && _canonicalLevel != 'premium'
+                ? _canonicalLevel
+                : null));
+    final isCurrentPlan = activePlanId == plan.id;
+    final currentPlanPrice = activePlanId == null
+        ? 0.0
+        : _plans.firstWhere(
+            (p) => p.id == activePlanId,
+            orElse: () => _plans[0],
+          ).price;
     final isUpgrade = plan.price > currentPlanPrice;
 
     return Container(
