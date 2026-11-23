@@ -6,6 +6,7 @@ import 'package:lucide_icons/lucide_icons.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:in_app_purchase/in_app_purchase.dart';
+import 'package:in_app_purchase_storekit/in_app_purchase_storekit.dart';
 import 'package:url_launcher/url_launcher.dart';
 import '../data/apple_subscription_service.dart';
 import '../data/subscription_service.dart';
@@ -499,15 +500,23 @@ class _SubscriptionUpgradeScreenState extends State<SubscriptionUpgradeScreen> {
   }
 
   Future<void> _changeApplePlan(SubscriptionPlan plan) async {
-    final uri = Uri.parse('https://apps.apple.com/account/subscriptions');
-    final opened = await launchUrl(uri, mode: LaunchMode.externalApplication);
-    if (mounted && opened) {
-      _showMessage(
-        'Apple manages changes to an active subscription. Choose ${plan.name} '
-        'in Apple Subscriptions; a lower-duration plan starts at renewal.',
-      );
-    } else if (mounted) {
-      _showMessage('Could not open Apple subscription settings.');
+    try {
+      await _store
+          .getPlatformAddition<InAppPurchaseStoreKitPlatformAddition>()
+          .showManageSubscriptions();
+      if (mounted) {
+        _showMessage(
+          'Apple manages changes to an active subscription. The ${plan.interval} '
+          'option may start at renewal; your current plan stays active until then.',
+        );
+      }
+    } catch (_) {
+      if (mounted) {
+        _showMessage(
+          'Could not open Apple subscription options. You can manage the '
+          'Sandbox subscription in Settings → Developer → Sandbox Account → Manage → Subscriptions.',
+        );
+      }
     }
   }
 
